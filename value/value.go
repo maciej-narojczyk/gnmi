@@ -128,6 +128,11 @@ func ToScalar(tv *pb.TypedValue) (interface{}, error) {
 		i = ss
 	case *pb.TypedValue_BytesVal:
 		i = tv.GetBytesVal()
+	case *pb.TypedValue_JsonIetfVal:
+		var val interface{}
+		val = tv.GetJsonIetfVal()
+		json.Unmarshal(val.([]byte), &i)
+		// i = tv.GetJsonIetfVal()
 	case *gpb.TypedValue_JsonVal:
 		v := tv.GetJsonVal()
 		if err := json.Unmarshal(v, &i); err != nil {
