@@ -127,6 +127,7 @@ func sendQueryAndDisplay(ctx context.Context, query client.Query, cfg *Config) e
 		ctx, cancel = context.WithTimeout(ctx, cfg.StreamingDuration)
 		defer cancel()
 	}
+	fmt.Printf("sendQueryAndDisplay: %v %s %v\n", displayTypeMap[cfg.DisplayType], query.Type, query.Queries)
 	switch displayTypeMap[cfg.DisplayType] {
 	default:
 		return fmt.Errorf("unknown display type %q", cfg.DisplayType)
