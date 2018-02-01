@@ -38,15 +38,19 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"context"
 	"flag"
-	
+
+	"context"
 	log "github.com/golang/glog"
 	"golang.org/x/crypto/ssh/terminal"
 	"google.golang.org/protobuf/encoding/prototext"
+	"github.com/golang/protobuf/proto"
 	"github.com/openconfig/gnmi/cli"
 	"github.com/openconfig/gnmi/client"
 	"github.com/openconfig/gnmi/client/flags"
 	gclient "github.com/openconfig/gnmi/client/gnmi"
+	"golang.org/x/crypto/ssh/terminal"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 )
@@ -95,12 +99,19 @@ func init() {
 	flag.DurationVar(&cfg.StreamingDuration, "streaming_duration", 0, "Length of time to collect streaming queries (0 is infinite).")
 	flag.StringVar(&cfg.DisplayPrefix, "display_prefix", "", "Per output line prefix.")
 	flag.StringVar(&cfg.DisplayIndent, "display_indent", "  ", "Output line, per nesting-level indent.")
-	flag.StringVar(&cfg.DisplayType, "display_type", "group", "Display output type (g, group, s, single, p, proto).")
+	flag.StringVar(&cfg.DisplayType, "display_type", "group", "Display output type (g, group, s, single, p, proto, gh, graph).")
 	flag.StringVar(&q.Target, "target", "", "Name of the gNMI target.")
 	flag.DurationVar(&q.Timeout, "timeout", 30*time.Second, "Terminate query if no RPC is established within the timeout duration.")
 	flag.StringVar(&cfg.Timestamp, "timestamp", "", "Specify timestamp formatting in output.  One of (<empty string>, on, raw, <FORMAT>) where <empty string> is disabled, on is human readable, raw is int64 nanos since epoch, and <FORMAT> is according to golang time.Format(<FORMAT>)")
 	flag.BoolVar(&cfg.DisplaySize, "display_size", false, "Display the total size of query response.")
 	flag.BoolVar(&cfg.Latency, "latency", false, "Display the latency for receiving each update (Now - update timestamp).")
+	flag.UintVar(&cfg.Concurrent, "concurrent", 1, "Number of concurrent client connections to serve, for graph display type only.")
+	flag.UintVar(&cfg.ConcurrentMax, "concurrent_max", 1, "Double number of concurrent client connections until ConcurrentMax reached.")
+
+	flag.Var(deletes, "delete", `List of paths to delete; --set flag must be set. Format is "path1,path2,path3"`)
+	flag.Var(updates, "update", `List of paths to update; --set flag must be set. Format is "path1=val1,path2=val2,path3=val3"`)
+	flag.Var(replaces, "replace", `List of paths to replace; --set flag must be set. Format is "path1=val1,path2=val2,path3=val3"`)
+
 	flag.StringVar(&q.TLS.ServerName, "server_name", "", "When set, CLI will use this hostname to verify server certificate during TLS handshake.")
 	flag.BoolVar(&q.TLS.InsecureSkipVerify, "tls_skip_verify", false, "When set, CLI will not verify the server certificate during TLS handshake.")
 
