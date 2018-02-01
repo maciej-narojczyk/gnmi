@@ -45,6 +45,7 @@ var (
 		"s": "SINGLE", "single": "SINGLE", "SINGLE": "SINGLE",
 		"p": "PROTO", "proto": "PROTO", "PROTO": "PROTO",
 		"sp": "SHORTPROTO", "shortproto": "SHORTPROTO", "SHORTPROTO": "SHORTPROTO",
+		"gh": "GRAPH", "graph": "GRAPH", "GRAPH": "GRAPH",
 	}
 )
 
@@ -59,16 +60,18 @@ type Config struct {
 	Display           func([]byte)  // Function called to display each result.
 	DisplayPrefix     string        // Prefix for each line of result output.
 	DisplayIndent     string        // Indent per nesting level of result output.
-	DisplayType       string        // Display results in selected format, grouped, single, proto.
+	DisplayType       string        // Display results in selected format, grouped, single, proto, graph.
 	DisplayPeer       bool          // Display the immediate connected peer.
 	// <empty string> - disable timestamp
 	// on - human readable timestamp according to layout
 	// raw - int64 nanos since epoch
 	// <FORMAT> - human readable timestamp according to <FORMAT>
-	Timestamp   string // Formatting of timestamp in result output.
-	DisplaySize bool
-	Latency     bool     // Show latency to client
-	ClientTypes []string // List of client types to try.
+	Timestamp     string // Formatting of timestamp in result output.
+	DisplaySize   bool
+	Latency       bool     // Show latency to client
+	ClientTypes   []string // List of client types to try.
+	Concurrent    uint     // Number of concurrent client connections to server, for graph display type only.
+	ConcurrentMax uint     // Double number of concurrent client connections until MaxConcurrent reached.
 }
 
 // QueryType returns a client query type for t after trying aliases for the
@@ -123,6 +126,8 @@ func sendQueryAndDisplay(ctx context.Context, query client.Query, cfg *Config) e
 			// Trim it down.
 			return bytes.TrimSpace([]byte(r.String()))
 		})
+	case "GRAPH":
+		return displayGraphResults(ctx, query, cfg)
 	}
 	switch query.Type {
 	default:
