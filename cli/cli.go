@@ -127,7 +127,12 @@ func sendQueryAndDisplay(ctx context.Context, query client.Query, cfg *Config) e
 			return bytes.TrimSpace([]byte(r.String()))
 		})
 	case "GRAPH":
-		return displayGraphResults(ctx, query, cfg)
+		if query.Type == client.Poll {
+			return displayGraphResults(ctx, query, cfg)
+		} else {
+			return fmt.Errorf("GRAPH display only supports poll query")
+		}
+
 	}
 	switch query.Type {
 	default:
