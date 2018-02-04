@@ -7,13 +7,14 @@ import (
 	stats "github.com/openconfig/gnmi/cli/stats"
 	"github.com/openconfig/gnmi/client"
 	//	"strconv"
-	"sync"
-	"time"
-
+	"encoding/json"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/plotutil"
 	"gonum.org/v1/plot/vg"
+	"io/ioutil"
+	"sync"
+	"time"
 )
 
 type groupRecord struct {
@@ -138,6 +139,7 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 			cfg.Display([]byte(fmt.Sprintf("sessionGrp:sessionNo (%v:%v) latency %v ms\n", grp, sessionNo, ms)))
 		}
 	}
+	saveJsonFile(grps, groupRecordMap)
 	//plotGraph("Session Latency", "Session No.", "ms", groupRecordMap)
 	if len(grps) > 1 {
 		plotGroupsGraph("Session Group Latency", "Session Number", "ms", grps, groupRecordMap)
@@ -151,6 +153,37 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 		}
 	}
 	return nil
+}
+
+// saveJsonFile saves the raw data to json file
+func saveJsonFile(grps []uint, grpMap map[uint]groupRecord) error {
+
+	// To renders the data to map[string]interface{} for JSON marshall.
+	msiGroup := make(map[string]interface{})
+
+	for _, grp := range grps { // For each session group
+		grmap := grpMap[grp].grMap
+
+		msiSession := make(map[string]interface{})
+		for sessNo, rd := range grmap { // for each session
+			msiPoll := make(map[string]interface{})
+			for i := 0; i < len(rd.Sts); i++ {
+				msiTs := map[string]interface{}{}
+				// poll time stamp , may use strconf.FormatInt()
+				msiTs["poll_ts"] = rd.Rts[i].UnixNano()
+				msiTs["synced_ts"] = rd.Sts[i].UnixNano()
+				msiPoll[fmt.Sprintf("poll_%v", i)] = msiTs
+			}
+			msiSession[fmt.Sprintf("session_%v", sessNo)] = msiPoll
+		}
+		msiGroup[fmt.Sprintf("group_%v", grp)] = msiSession
+	}
+	j, err := json.MarshalIndent(msiGroup, "", "  ")
+	if err != nil {
+		return fmt.Errorf("JSON marshalling error: %v", err)
+	}
+	err = ioutil.WriteFile("raw_data.json", j, 0644)
+	return err
 }
 
 //data for one session group
