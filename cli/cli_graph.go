@@ -21,6 +21,103 @@ type groupRecord struct {
 	grMap map[uint]*stats.Record //record for one session group
 }
 
+type cpuStat struct {
+	CpuUsageAll cpuUtil   `json:"cpu_all"`
+	CpuUsage    []cpuUtil `json:"cpus"`
+}
+
+// Cpu utilization rate
+type cpuUtil struct {
+	Id            string `json:"id"`
+	CpuUtil_100ms uint64 `json:"100ms"`
+	CpuUtil_1s    uint64 `json:"1s"`
+	CpuUtil_5s    uint64 `json:"5s"`
+	CpuUtil_1min  uint64 `json:"1min"`
+	CpuUtil_5min  uint64 `json:"5min"`
+}
+
+func printCpuUtilization(r cpuStat) {
+	b, err := json.MarshalIndent(&r, "", "  ")
+	if err != nil {
+		fmt.Printf("Error: %s", err)
+		return
+	}
+	log.V(1).Infof(string(b))
+
+}
+func runCpuStats(ctx context.Context, query client.Query, stop chan struct{}) {
+
+	var cpuRecs []cpuStat
+	var cpuLoadedRecs []cpuStat
+	var cpuIdleRecs []cpuStat
+	var err error
+
+	query.NotificationHandler = func(n client.Notification) error {
+		switch v := n.(type) {
+		case client.Update:
+			var rec cpuStat
+			err = json.Unmarshal(v.Val.([]byte), &rec)
+			if err != nil {
+				log.V(1).Infof("Error: %v", v)
+			}
+			cpuRecs = append(cpuRecs, rec)
+		case client.Delete:
+		case client.Sync:
+		case client.Error:
+			log.V(1).Infof("Error: %v", v)
+		}
+		return nil
+	}
+
+	c, _ := stats.NewStatsClient(ctx, query.Destination())
+	defer c.Close()
+	log.V(1).Infof("runCpuStats loaded testing started")
+	if err = c.Subscribe(ctx, query); err != nil {
+		log.V(1).Infof("client had error while Subscribe: %v", err)
+		return
+	}
+	if err = c.RecvAll(); err != nil {
+		if err != nil {
+			log.V(1).Infof("client had error while Subscribe Recv: %v", err)
+			return
+		}
+
+	}
+	for {
+		if err = c.Poll(); err != nil {
+			log.V(1).Infof("client.Poll(): %v", err)
+			return
+		}
+		if err = c.RecvAll(); err != nil {
+			if err != nil {
+				log.V(1).Infof("client had error while Poll Recv: %v", err)
+				return
+			}
+		}
+		select {
+		default:
+			//time.Sleep(100 * time.Millisecond)
+			time.Sleep(time.Second)
+		case _, more := <-stop:
+			if more {
+				log.V(1).Infof("runCpuStats number of record collected %v", len(cpuRecs))
+				printCpuUtilization(cpuRecs[len(cpuRecs)-1])
+				cpuLoadedRecs = cpuRecs
+				log.V(1).Infof("runCpuStats idle testing started")
+			} else {
+				cpuIdleRecs = cpuRecs[len(cpuLoadedRecs):]
+				log.V(1).Infof("runCpuStats number of record collected %v", len(cpuIdleRecs))
+				printCpuUtilization(cpuRecs[len(cpuRecs)-1])
+				plotCpuGraph("CPU utilization", "time (second)", "percents", cpuLoadedRecs, cpuIdleRecs)
+				log.V(1).Infof("runCpuStats routine done")
+				return
+			}
+
+		}
+
+	}
+}
+
 // displayGraphResults collect request/response data and display them graphically
 // Assuming poll request
 func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) error {
@@ -54,6 +151,14 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 		return nil
 	}
 
+	cpuQuery := query
+	//cpuQuery.PollingInterval = 100 * time.Millisecond
+	cpuQuery.Queries = []client.Path{{"platform", "cpu"}}
+	cpuQuery.Target = "OTHERS"
+	stopCh := make(chan struct{}, 1)
+	go runCpuStats(ctx, cpuQuery, stopCh)
+	ts := time.Now()
+
 	for _, grp := range grps {
 		grMap := make(map[uint]*stats.Record)
 		groupRecordMap[grp] = groupRecord{grMap}
@@ -84,8 +189,10 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 					}
 
 				}
+				ts_poll := time.Now()
 				for count := cfg.Count; count > 0; count-- {
-					time.Sleep(cfg.PollingInterval)
+					time.Sleep(cfg.PollingInterval - time.Since(ts_poll))
+					ts_poll = time.Now()
 					if err := c.Poll(); err != nil {
 						cfg.Display([]byte(fmt.Sprintf("client.Poll(): %v", err)))
 						return
@@ -104,8 +211,12 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 		}
 		w.Wait()
 		cfg.Display([]byte(fmt.Sprintf("%v sessionGrp %v done cfg.Count %v\n", time.Now().String(), grp, cfg.Count)))
-		time.Sleep(time.Second)
 	}
+	time.Sleep(time.Millisecond * 100)
+	stopCh <- struct{}{}
+	time.Sleep(time.Since(ts))
+	close(stopCh)
+	time.Sleep(time.Second)
 
 	for _, grp := range grps {
 		grd := groupRecordMap[uint(grp)]
@@ -149,7 +260,7 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 		} else {
 			// latency fluctuation for one session
 			groupRecord := groupRecordMap[grps[0]]
-			plotSessionGraph("Single Session latency", "Poll No.", "ms", groupRecord.grMap[1])
+			plotSessionGraph("Single Session latency", "time (second)", "Latency (ms)", groupRecord.grMap[1])
 		}
 	}
 	return nil
@@ -183,6 +294,7 @@ func saveJsonFile(grps []uint, grpMap map[uint]groupRecord) error {
 		return fmt.Errorf("JSON marshalling error: %v", err)
 	}
 	err = ioutil.WriteFile("raw_data.json", j, 0644)
+	fmt.Printf("Raw latency data save to raw_data.json\n")
 	return err
 }
 
@@ -190,11 +302,13 @@ func saveJsonFile(grps []uint, grpMap map[uint]groupRecord) error {
 func addSessionPollPoints(rd *stats.Record) plotter.XYs {
 	pts := make(plotter.XYs, len(rd.Sts))
 
+	start := rd.Sts[0]
 	for idx := 0; idx < len(rd.Sts); idx++ {
 		diff := rd.Sts[idx].Sub(rd.Rts[idx])
 		ms := int64(diff / time.Millisecond)
 
-		x := float64(idx)
+		//x := float64(rd.Rts[idx].Sub(start) / time.Millisecond)
+		x := float64(rd.Rts[idx].Sub(start) / time.Second)
 		y := float64(ms)
 		pts[idx].X = x
 		pts[idx].Y = y
@@ -221,6 +335,47 @@ func plotSessionGraph(title, x, y string, rd *stats.Record) error {
 	}
 	// Save the plot to a PNG file.
 	if err := p.Save(16*vg.Inch, 8*vg.Inch, "session_latency.png"); err != nil {
+		log.V(1).Infof("save PNG %v", err)
+		return err
+	}
+	return nil
+}
+
+//data for one session group
+func addCpuUtilPoints(cpuRecs []cpuStat) plotter.XYs {
+	pts := make(plotter.XYs, len(cpuRecs))
+	for idx, stat := range cpuRecs {
+		//rate := int64(stat.CpuUsageAll.CpuUtil_100ms)
+		//x := float64(idx) * 100
+		rate := int64(stat.CpuUsageAll.CpuUtil_1s)
+		x := float64(idx)
+		y := float64(rate)
+		pts[idx].X = x
+		pts[idx].Y = y
+	}
+	return pts
+}
+
+func plotCpuGraph(title, x, y string, cpuLoadRecs, cpuRecs []cpuStat) error {
+	p, err := plot.New()
+	if err != nil {
+		log.V(1).Infof("plot %v", err)
+		return err
+	}
+
+	p.Title.Text = title
+	p.X.Label.Text = x
+	p.Y.Label.Text = y
+
+	err = plotutil.AddLinePoints(p,
+		"cpuWithTelemetry", addCpuUtilPoints(cpuLoadRecs),
+		"cpuWithoutTelemetry", addCpuUtilPoints(cpuRecs))
+	if err != nil {
+		log.V(1).Infof("plotutil.AddLinePoints %v", err)
+		return err
+	}
+	// Save the plot to a PNG file.
+	if err := p.Save(16*vg.Inch, 8*vg.Inch, "cpu_utilization.png"); err != nil {
 		log.V(1).Infof("save PNG %v", err)
 		return err
 	}
