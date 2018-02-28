@@ -175,6 +175,7 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 				// cfg.Display([]byte(fmt.Sprintf("start grp:sessionNo %v:%v , grMap : %v", grp, sessionNo, grMap)))
 
 				defer w.Done()
+				startTs := time.Now()
 				c, _ := stats.NewStatsClient(ctx, query.Destination())
 				defer c.Close()
 
@@ -191,6 +192,7 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 				}
 				ts_poll := time.Now()
 				for count := cfg.Count; count > 0; count-- {
+					log.V(2).Infof("count %v, actual working time %v", count, time.Since(ts_poll))
 					time.Sleep(cfg.PollingInterval - time.Since(ts_poll))
 					ts_poll = time.Now()
 					if err := c.Poll(); err != nil {
@@ -204,6 +206,10 @@ func displayGraphResults(ctx context.Context, query client.Query, cfg *Config) e
 						}
 					}
 				}
+				if sessionNo == 1 {
+					log.V(1).Infof("time taken for session 1 is %v with polling interval %v", time.Since(startTs), cfg.PollingInterval)
+				}
+
 				gMu.Lock()
 				grMap[sessionNo] = &c.Rd
 				gMu.Unlock()
@@ -294,7 +300,7 @@ func saveJsonFile(grps []uint, grpMap map[uint]groupRecord) error {
 		return fmt.Errorf("JSON marshalling error: %v", err)
 	}
 	err = ioutil.WriteFile("raw_data.json", j, 0644)
-	fmt.Printf("Raw latency data save to raw_data.json\n")
+	fmt.Printf("Raw latency data saved to raw_data.json\n")
 	return err
 }
 
