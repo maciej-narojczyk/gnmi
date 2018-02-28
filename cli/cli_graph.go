@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	log "github.com/golang/glog"
-	stats "github.com/openconfig/gnmi/cli/stats"
+	stats "github.com/jipanyang/gnmi/cli/stats"
 	"github.com/openconfig/gnmi/client"
 	//	"strconv"
 	"encoding/json"
