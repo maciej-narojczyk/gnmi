@@ -159,7 +159,7 @@ func (c *Client) RecvAll() error {
 			c.Close()
 			return err
 		case io.EOF, client.ErrStopReading:
-			log.V(2).Infof("RecvAll stop marker: %v", err)
+			log.V(3).Infof("RecvAll stop marker: %v", err)
 			return nil
 		case nil:
 		}
@@ -194,7 +194,7 @@ func (c *Client) defaultRecv(msg proto.Message) error {
 	if !ok {
 		return fmt.Errorf("failed to type assert message %#v", msg)
 	}
-	log.V(2).Info(resp)
+	log.V(5).Info(resp)
 	switch v := resp.Response.(type) {
 	default:
 		return fmt.Errorf("unknown response %T: %s", v, v)
