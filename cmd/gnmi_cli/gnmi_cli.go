@@ -46,7 +46,7 @@ import (
 	"golang.org/x/crypto/ssh/terminal"
 	"google.golang.org/protobuf/encoding/prototext"
 	"github.com/golang/protobuf/proto"
-	"github.com/openconfig/gnmi/cli"
+	"github.com/jipanyang/gnmi/cli"
 	"github.com/openconfig/gnmi/client"
 	"github.com/openconfig/gnmi/client/flags"
 	gclient "github.com/openconfig/gnmi/client/gnmi"
