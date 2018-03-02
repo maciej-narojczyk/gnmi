@@ -53,6 +53,8 @@ import (
 	"golang.org/x/crypto/ssh/terminal"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
+	// Register supported client types.
+	gclient "github.com/jipanyang/gnmi/client/gnmi"
 )
 
 var (
