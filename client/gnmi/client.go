@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"context"
 	log "github.com/golang/glog"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc"
@@ -38,6 +39,9 @@ import (
 	"github.com/openconfig/gnmi/client"
 	"github.com/openconfig/gnmi/path"
 	"github.com/openconfig/gnmi/value"
+	"github.com/openconfig/ygot/ygot"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 )
@@ -274,6 +278,53 @@ func subscribe(q client.Query) (*gpb.SubscribeRequest, error) {
 	return &gpb.SubscribeRequest{Request: s}, nil
 }
 
+// decimalToFloat converts a *gnmi_proto.Decimal64 to a float32. Downcasting to float32 is performed as the
+// precision of a float64 is not required.
+func decimalToFloat(d *gpb.Decimal64) float32 {
+	return float32(float64(d.Digits) / math.Pow(10, float64(d.Precision)))
+}
+
+// ToScalar will convert TypedValue scalar types to a Go native type. It will
+// return an error if the TypedValue does not contain a scalar type.
+func toScalar(tv *gpb.TypedValue) (interface{}, error) {
+	var i interface{}
+	switch tv.Value.(type) {
+	case *gpb.TypedValue_DecimalVal:
+		i = decimalToFloat(tv.GetDecimalVal())
+	case *gpb.TypedValue_StringVal:
+		i = tv.GetStringVal()
+	case *gpb.TypedValue_IntVal:
+		i = tv.GetIntVal()
+	case *gpb.TypedValue_UintVal:
+		i = tv.GetUintVal()
+	case *gpb.TypedValue_BoolVal:
+		i = tv.GetBoolVal()
+	case *gpb.TypedValue_FloatVal:
+		i = tv.GetFloatVal()
+	case *gpb.TypedValue_LeaflistVal:
+		elems := tv.GetLeaflistVal().GetElement()
+		ss := make([]interface{}, len(elems))
+		for x, e := range elems {
+			v, err := toScalar(e)
+			if err != nil {
+				return nil, fmt.Errorf("ToScalar for ScalarArray %+v: %v", e.Value, err)
+			}
+			ss[x] = v
+		}
+		i = ss
+	case *gpb.TypedValue_BytesVal:
+		i = tv.GetBytesVal()
+	case *gpb.TypedValue_JsonIetfVal:
+		var val interface{}
+		val = tv.GetJsonIetfVal()
+		json.Unmarshal(val.([]byte), &i)
+		//i = tv.GetJsonIetfVal()
+	default:
+		return nil, fmt.Errorf("non-scalar type %+v", tv.Value)
+	}
+	return i, nil
+}
+
 func noti(prefix []string, pp *gpb.Path, ts time.Time, u *gpb.Update) (client.Notification, error) {
 	sp := path.ToStrings(pp, false)
 	// Make a full new copy of prefix + u.Path to avoid any reuse of underlying
@@ -286,7 +337,7 @@ func noti(prefix []string, pp *gpb.Path, ts time.Time, u *gpb.Update) (client.No
 		return client.Delete{Path: p, TS: ts}, nil
 	}
 	if u.Val != nil {
-		val, err := value.ToScalar(u.Val)
+		val, err := toScalar(u.Val)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode %s: %v", p, err)
 		}
