@@ -41,7 +41,6 @@ import (
 	"context"
 	"flag"
 
-	"context"
 	log "github.com/golang/glog"
 	"golang.org/x/crypto/ssh/terminal"
 	"google.golang.org/protobuf/encoding/prototext"
@@ -49,7 +48,6 @@ import (
 	"github.com/jipanyang/gnmi/cli"
 	"github.com/openconfig/gnmi/client"
 	"github.com/openconfig/gnmi/client/flags"
-	gclient "github.com/openconfig/gnmi/client/gnmi"
 	"golang.org/x/crypto/ssh/terminal"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
@@ -112,10 +110,6 @@ func init() {
 	flag.BoolVar(&cfg.FilterUpdates, "filter_updates", false, "Filter out update results. Works with single display type only.")
 	flag.UintVar(&cfg.Concurrent, "concurrent", 1, "Number of concurrent client connections to serve, for graph display type only.")
 	flag.UintVar(&cfg.ConcurrentMax, "concurrent_max", 1, "Double number of concurrent client connections until ConcurrentMax reached.")
-
-	flag.Var(deletes, "delete", `List of paths to delete; --set flag must be set. Format is "path1,path2,path3"`)
-	flag.Var(updates, "update", `List of paths to update; --set flag must be set. Format is "path1=val1,path2=val2,path3=val3"`)
-	flag.Var(replaces, "replace", `List of paths to replace; --set flag must be set. Format is "path1=val1,path2=val2,path3=val3"`)
 
 	flag.StringVar(&q.TLS.ServerName, "server_name", "", "When set, CLI will use this hostname to verify server certificate during TLS handshake.")
 	flag.BoolVar(&q.TLS.InsecureSkipVerify, "tls_skip_verify", false, "When set, CLI will not verify the server certificate during TLS handshake.")
