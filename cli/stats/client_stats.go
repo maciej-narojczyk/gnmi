@@ -1,24 +1,7 @@
-/*
-Copyright 2017 Google Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package stats
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -237,83 +220,6 @@ func (c *Client) defaultRecv(msg proto.Message) error {
 		}
 	}
 	return nil
-}
-
-// Set calls the Set RPC, converting request/response to appropriate protos.
-func (c *Client) Set(ctx context.Context, sr client.SetRequest) (client.SetResponse, error) {
-	req, err := convertSetRequest(sr)
-	if err != nil {
-		return client.SetResponse{}, err
-	}
-
-	resp, err := c.client.Set(ctx, req)
-	if err != nil {
-		return client.SetResponse{}, err
-	}
-
-	return convertSetResponse(resp)
-}
-
-func convertSetRequest(sr client.SetRequest) (*gpb.SetRequest, error) {
-	req := &gpb.SetRequest{}
-	for _, d := range sr.Delete {
-		pp, err := ygot.StringToPath(pathToString(d), ygot.StructuredPath, ygot.StringSlicePath)
-		if err != nil {
-			return nil, fmt.Errorf("invalid delete path %q: %v", d, err)
-		}
-		req.Delete = append(req.Delete, pp)
-	}
-
-	genUpdate := func(v client.Leaf) (*gpb.Update, error) {
-		buf, err := json.Marshal(v.Val)
-		if err != nil {
-			return nil, err
-		}
-		pp, err := ygot.StringToPath(pathToString(v.Path), ygot.StructuredPath, ygot.StringSlicePath)
-		if err != nil {
-			return nil, fmt.Errorf("invalid update path %q: %v", v.Path, err)
-		}
-		return &gpb.Update{
-			Path: pp,
-			Val:  &gpb.TypedValue{Value: &gpb.TypedValue_JsonVal{buf}},
-			// Value is deprecated, remove it at some point.
-			Value: &gpb.Value{Type: gpb.Encoding_JSON, Value: buf},
-		}, nil
-	}
-
-	for _, u := range sr.Update {
-		uu, err := genUpdate(u)
-		if err != nil {
-			return nil, err
-		}
-		req.Update = append(req.Update, uu)
-	}
-	for _, u := range sr.Replace {
-		uu, err := genUpdate(u)
-		if err != nil {
-			return nil, err
-		}
-		req.Replace = append(req.Replace, uu)
-	}
-
-	return req, nil
-}
-
-func convertSetResponse(sr *gpb.SetResponse) (client.SetResponse, error) {
-	resp := client.SetResponse{
-		TS: time.Unix(0, sr.GetTimestamp()),
-	}
-	var errs []string
-	for _, r := range sr.GetResponse() {
-		if r.Message != nil {
-			errs = append(errs, r.GetMessage().String())
-		}
-	}
-	if len(errs) > 0 {
-		return resp, errors.New(strings.Join(errs, "; "))
-	}
-
-	return resp, nil
 }
 
 func getType(t client.Type) gpb.SubscriptionList_Mode {
