@@ -192,7 +192,8 @@ func (c *Client) defaultRecv(msg proto.Message) error {
 		}
 	case *gpb.SubscribeResponse_Update:
 		n := v.Update
-		p := path.ToStrings(n.Prefix, true)
+		// skip target from path prefix with parameter "false"
+		p := path.ToStrings(n.Prefix, false)
 		ts := time.Unix(0, n.Timestamp)
 		for _, u := range n.Update {
 			if u.Path == nil {
