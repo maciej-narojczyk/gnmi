@@ -17,19 +17,18 @@ limitations under the License.
 package client
 
 import (
+	"context"
 	"crypto/tls"
 	"testing"
 	"time"
 
-	"context"
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/kylelemons/godebug/pretty"
 	"google.golang.org/grpc"
 	"github.com/openconfig/ygot/ygot"
 	"github.com/openconfig/gnmi/client"
 	"github.com/openconfig/gnmi/testing/fake/gnmi"
 	"github.com/openconfig/gnmi/testing/fake/testing/grpc/config"
+	"github.com/openconfig/gnmi/value"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 	fpb "github.com/openconfig/gnmi/testing/fake/proto"
@@ -59,7 +58,7 @@ func TestClient(t *testing.T) {
 			TLS:     &tls.Config{InsecureSkipVerify: true},
 		},
 		updates: []*fpb.Value{{
-			Path:      []string{"dev", "a"},
+			Path:      []string{"a"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
@@ -83,7 +82,7 @@ func TestClient(t *testing.T) {
 			TLS:     &tls.Config{InsecureSkipVerify: true},
 		},
 		updates: []*fpb.Value{{
-			Path:      []string{"dev", "a"},
+			Path:      []string{"a"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
@@ -112,17 +111,17 @@ func TestClient(t *testing.T) {
 			TLS:     &tls.Config{InsecureSkipVerify: true},
 		},
 		updates: []*fpb.Value{{
-			Path:      []string{"dev", "a"},
+			Path:      []string{"a"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 200},
 			Repeat:    1,
 			Value:     &fpb.Value_Delete{Delete: &fpb.DeleteValue{}},
@@ -152,27 +151,27 @@ func TestClient(t *testing.T) {
 			Repeat:    1,
 			Value:     &fpb.Value_Sync{Sync: 1},
 		}, {
-			Path:      []string{"dev", "a"},
+			Path:      []string{"a"},
 			Timestamp: &fpb.Timestamp{Timestamp: 200},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 200},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "c"},
+			Path:      []string{"a", "c"},
 			Timestamp: &fpb.Timestamp{Timestamp: 200},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 300},
 			Repeat:    1,
 			Value:     &fpb.Value_Delete{Delete: &fpb.DeleteValue{}},
 		}, {
-			Path:      []string{"dev", "a", "c"},
+			Path:      []string{"a", "c"},
 			Timestamp: &fpb.Timestamp{Timestamp: 400},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 50}},
@@ -202,7 +201,6 @@ func TestClient(t *testing.T) {
 				},
 				[]grpc.ServerOption{opt},
 			)
-			go s.Serve()
 			if err != nil {
 				t.Fatal("failed to start test server")
 			}
@@ -269,7 +267,7 @@ func TestGNMIMessageUpdates(t *testing.T) {
 				Timestamp: 200,
 				Update: []*gpb.Update{
 					{
-						Path: &gpb.Path{Element: []string{"dev", "a"}},
+						Path: &gpb.Path{Element: []string{"a"}},
 						Val:  &gpb.TypedValue{Value: &gpb.TypedValue_IntVal{5}},
 					},
 				},
@@ -317,7 +315,6 @@ func TestGNMIMessageUpdates(t *testing.T) {
 		},
 		[]grpc.ServerOption{opt},
 	)
-	go s.Serve()
 	if err != nil {
 		t.Fatal("failed to start test server")
 	}
@@ -358,7 +355,7 @@ func TestGNMIWithSubscribeRequest(t *testing.T) {
 				Timestamp: 200,
 				Update: []*gpb.Update{
 					{
-						Path: &gpb.Path{Element: []string{"dev", "a"}},
+						Path: &gpb.Path{Element: []string{"a"}},
 						Val:  &gpb.TypedValue{Value: &gpb.TypedValue_IntVal{5}},
 					},
 				},
@@ -406,7 +403,6 @@ func TestGNMIWithSubscribeRequest(t *testing.T) {
 		},
 		[]grpc.ServerOption{opt},
 	)
-	go s.Serve()
 	if err != nil {
 		t.Fatal("failed to start test server")
 	}
@@ -450,11 +446,14 @@ func TestNoti(t *testing.T) {
 			u:        &gpb.Update{Val: &gpb.TypedValue{Value: &gpb.TypedValue_IntVal{5}}},
 			wantNoti: client.Update{Path: []string{"dev", "a"}, TS: time.Unix(0, 100), Val: 5},
 		}, {
-			desc:    "update with non-scalar TypedValue",
-			path:    stringToPath("dev/a"),
-			ts:      time.Unix(0, 100),
-			u:       &gpb.Update{Val: &gpb.TypedValue{Value: &gpb.TypedValue_JsonVal{[]byte("5")}}},
-			wantErr: true,
+			desc: "update with non-scalar TypedValue",
+			path: stringToPath("dev/a"),
+			ts:   time.Unix(0, 100),
+			u:    &gpb.Update{Val: &gpb.TypedValue{Value: &gpb.TypedValue_JsonVal{[]byte("5")}}},
+			wantNoti: client.Update{Path: []string{"dev", "a"}, TS: time.Unix(0, 100), Val: value.DeprecatedScalar{
+				Message: "Deprecated TypedValue_JsonVal",
+				Value:   5,
+			}},
 		}, {
 			desc:     "update with JSON value",
 			path:     stringToPath("dev/a"),
@@ -499,127 +498,6 @@ func TestNoti(t *testing.T) {
 		if diff := pretty.Compare(tt.wantNoti, got); diff != "" {
 			t.Errorf("%s: notification diff:\n%s", tt.desc, diff)
 		}
-	}
-}
-
-func TestProtoResponse(t *testing.T) {
-	tests := []struct {
-		desc    string
-		notifs  []client.Notification
-		want    *gpb.SubscribeResponse
-		wantErr bool
-	}{
-		{
-			desc: "empty response",
-			want: &gpb.SubscribeResponse{Response: &gpb.SubscribeResponse_Update{Update: new(gpb.Notification)}},
-		},
-		{
-			desc: "updates and deletes",
-			notifs: []client.Notification{
-				client.Update{Path: client.Path{"a", "b"}, Val: 1, TS: time.Unix(0, 2)},
-				client.Delete{Path: client.Path{"d", "e"}, TS: time.Unix(0, 4)},
-				client.Update{Path: client.Path{"a", "c"}, Val: 2, TS: time.Unix(0, 3)},
-			},
-			want: &gpb.SubscribeResponse{Response: &gpb.SubscribeResponse_Update{Update: &gpb.Notification{
-				Timestamp: 2,
-				Update: []*gpb.Update{
-					{
-						Path: &gpb.Path{
-							Element: []string{"a", "b"},
-							Elem:    []*gpb.PathElem{{Name: "a"}, {Name: "b"}},
-						},
-						Val: &gpb.TypedValue{Value: &gpb.TypedValue_IntVal{1}},
-					},
-					{
-						Path: &gpb.Path{
-							Element: []string{"a", "c"},
-							Elem:    []*gpb.PathElem{{Name: "a"}, {Name: "c"}},
-						},
-						Val: &gpb.TypedValue{Value: &gpb.TypedValue_IntVal{2}},
-					},
-				},
-				Delete: []*gpb.Path{
-					{
-						Element: []string{"d", "e"},
-						Elem:    []*gpb.PathElem{{Name: "d"}, {Name: "e"}},
-					},
-				},
-			}}},
-		},
-		{
-			desc: "nil updates",
-			notifs: []client.Notification{
-				client.Delete{Path: client.Path{"d", "e"}, TS: time.Unix(0, 4)},
-			},
-			want: &gpb.SubscribeResponse{Response: &gpb.SubscribeResponse_Update{Update: &gpb.Notification{
-				Timestamp: 4,
-				Delete: []*gpb.Path{
-					{
-						Element: []string{"d", "e"},
-						Elem:    []*gpb.PathElem{{Name: "d"}, {Name: "e"}},
-					},
-				},
-			}}},
-		},
-		{
-			desc: "nil deletes",
-			notifs: []client.Notification{
-				client.Update{Path: client.Path{"a", "b"}, Val: 1, TS: time.Unix(0, 2)},
-				client.Update{Path: client.Path{"a", "c"}, Val: 2, TS: time.Unix(0, 3)},
-			},
-			want: &gpb.SubscribeResponse{Response: &gpb.SubscribeResponse_Update{Update: &gpb.Notification{
-				Timestamp: 2,
-				Update: []*gpb.Update{
-					{
-						Path: &gpb.Path{
-							Element: []string{"a", "b"},
-							Elem:    []*gpb.PathElem{{Name: "a"}, {Name: "b"}},
-						},
-						Val: &gpb.TypedValue{Value: &gpb.TypedValue_IntVal{1}},
-					},
-					{
-						Path: &gpb.Path{
-							Element: []string{"a", "c"},
-							Elem:    []*gpb.PathElem{{Name: "a"}, {Name: "c"}},
-						},
-						Val: &gpb.TypedValue{Value: &gpb.TypedValue_IntVal{2}},
-					},
-				},
-			}}},
-		},
-		{
-			desc: "bad path",
-			notifs: []client.Notification{
-				client.Update{Path: client.Path{"a[b=]"}, Val: 1, TS: time.Unix(0, 2)},
-			},
-			wantErr: true,
-		},
-		{
-			desc: "bad notification type",
-			notifs: []client.Notification{
-				client.Sync{},
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.desc, func(t *testing.T) {
-			got, err := ProtoResponse(tt.notifs...)
-			if err != nil && !tt.wantErr {
-				t.Fatalf("got error %v, want nil", err)
-			}
-			if err == nil && tt.wantErr {
-				t.Fatal("got nil error, want non-nil")
-			}
-			if err != nil {
-				return
-			}
-
-			if diff := cmp.Diff(got, tt.want, cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("got/want diff:\n%s", diff)
-			}
-		})
 	}
 }
 

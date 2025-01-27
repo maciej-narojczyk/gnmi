@@ -18,28 +18,34 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net"
 	"time"
 
 	
 	log "github.com/golang/glog"
-	"context"
-	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc"
+	"github.com/openconfig/grpctunnel/dialer"
+	"github.com/openconfig/grpctunnel/tunnel"
+	"google.golang.org/protobuf/encoding/prototext"
 	"github.com/openconfig/gnmi/cache"
-	"github.com/openconfig/gnmi/client"
-	gnmiclient "github.com/openconfig/gnmi/client/gnmi"
+	coll "github.com/openconfig/gnmi/collector"
+	"github.com/openconfig/gnmi/connection"
+	"github.com/openconfig/gnmi/manager"
 	"github.com/openconfig/gnmi/subscribe"
 	"github.com/openconfig/gnmi/target"
 
+	tunnelpb "github.com/openconfig/grpctunnel/proto/tunnel"
+	cpb "github.com/openconfig/gnmi/proto/collector"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
-	targetpb "github.com/openconfig/gnmi/proto/target"
+	tpb "github.com/openconfig/gnmi/proto/target"
 )
 
 var (
@@ -63,6 +69,50 @@ func periodic(period time.Duration, fn func()) {
 	}
 }
 
+func (c *collector) addTargetHandler(t tunnel.Target) error {
+	log.Infof("tunnel connection attempted from target %s: %s", t.ID, t.Type)
+
+	if t.Type != tunnelpb.TargetType_GNMI_GNOI.String() {
+		return fmt.Errorf("received unsupported type type: %s from target: %s, skipping", t.Type, t.ID)
+	}
+
+	// We assume the collector's configuration is authoritative on who can connect
+	// via tunnels.
+	target := c.config.Target[t.ID]
+	if target == nil {
+		return fmt.Errorf("tunnel target %s not found in config", t.ID)
+	}
+
+	if target.GetDialer() == "" {
+		return fmt.Errorf("tunnel dialer not specified for target %s", t.ID)
+	}
+
+	log.Infof("tunnel target %s accepted", t.ID)
+	return nil
+}
+
+func (c *collector) deleteTargetHandler(t tunnel.Target) error {
+	if t.Type != tunnelpb.TargetType_GNMI_GNOI.String() {
+		return fmt.Errorf("received unsupported type type: %s from target: %s, skipping", t.Type, t.ID)
+	}
+	log.Infof("deleting target %s", t.ID)
+	return nil
+}
+
+var defaultDialOpts []grpc.DialOption = []grpc.DialOption{
+	grpc.WithBlock(),
+	grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
+	// Today, we assume that we should not verify the certificate from the target.
+	grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})),
+}
+
+// unimplementedCredentials cache credentials for targets.
+type unimplementedCredentials struct{}
+
+func (cd *unimplementedCredentials) Lookup(_ context.Context, key string) (string, error) {
+	return "", fmt.Errorf("credentials lookup not implemented for key: %q", key)
+}
+
 // Under normal conditions, this function will not terminate.  Cancelling
 // the context will stop the collector.
 func runCollector(ctx context.Context) error {
@@ -76,13 +126,14 @@ func runCollector(ctx context.Context) error {
 		return errors.New("key_file must be specified")
 	}
 
-	c := collector{config: &targetpb.Configuration{}}
+	c := collector{config: &tpb.Configuration{}}
+
 	// Initialize configuration.
 	buf, err := ioutil.ReadFile(*configFile)
 	if err != nil {
 		return fmt.Errorf("Could not read configuration from %q: %v", *configFile, err)
 	}
-	if err := proto.UnmarshalText(string(buf), c.config); err != nil {
+	if err := prototext.Unmarshal(buf, c.config); err != nil {
 		return fmt.Errorf("Could not parse configuration from %q: %v", *configFile, err)
 	}
 	if err := target.Validate(c.config); err != nil {
@@ -96,23 +147,77 @@ func runCollector(ctx context.Context) error {
 	}
 
 	// Initialize cache.
-	cache.Type = cache.GnmiNoti
 	c.cache = cache.New(nil)
-
 	// Start functions to periodically update metadata stored in the cache for each target.
 	go periodic(*metadataUpdatePeriod, c.cache.UpdateMetadata)
 	go periodic(*sizeUpdatePeriod, c.cache.UpdateSize)
 
-	// Initialize collectors.
-	c.start(context.Background())
+	// Initialize tunnel server.
+	if c.tServer, err = tunnel.NewServer(tunnel.ServerConfig{AddTargetHandler: c.addTargetHandler, DeleteTargetHandler: c.deleteTargetHandler}); err != nil {
+		log.Fatalf("failed to setup tunnel server: %v", err)
+	}
+	tDialer, err := dialer.FromServer(c.tServer)
+	if err != nil {
+		log.Fatalf("failed to setup tunnel dialer: %v", err)
+	}
+
+	dialerContext := func(ctx context.Context, target string, opts ...grpc.DialOption) (conn *grpc.ClientConn, err error) {
+		return tDialer.DialContext(ctx, target, tunnelpb.TargetType_GNMI_GNOI.String(), opts...)
+	}
+	// Create connection manager with default dialer. Target specific dialer will be added later.
+	c.cm, err = connection.NewManagerCustom(
+		map[string]connection.Dial{
+			connection.DEFAULT: grpc.DialContext,
+			"tunnel":           dialerContext},
+		defaultDialOpts...)
+	if err != nil {
+		return fmt.Errorf("error creating connection.Manager: %v", err)
+	}
+
+	c.tm, err = manager.NewManager(manager.Config{
+		Credentials:       &unimplementedCredentials{},
+		Reset:             c.cache.Reset,
+		Sync:              c.cache.Sync,
+		Connect:           c.cache.Connect,
+		ConnectError:      c.cache.ConnectError,
+		ConnectionManager: c.cm,
+		Timeout:           *dialTimeout,
+		Update: func(target string, v *gnmipb.Notification) {
+			// Explicitly set all updates as having come from this target even if
+			// the target itself doesn't report or incorrectly reports the target
+			// field. Also promote an empty origin field to 'openconfig', the default
+			// origin for gNMI.
+			if prefix := v.GetPrefix(); prefix == nil {
+				v.Prefix = &gnmipb.Path{Origin: "openconfig", Target: target}
+			} else {
+				if prefix.Origin == "" {
+					prefix.Origin = "openconfig"
+				}
+				prefix.Target = target
+			}
+			if err := c.cache.GnmiUpdate(v); err != nil {
+				if log.V(2) {
+					log.Infof("dropped cache.Update(%#v): %v", v, err)
+				}
+			}
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("could not initialize target manager: %v", err)
+	}
 
 	// Create a grpc Server.
 	srv := grpc.NewServer(grpc.Creds(creds))
+
+	tunnelpb.RegisterTunnelServer(srv, c.tServer)
+
+	// Initialize collectors.
+	c.start(context.Background())
+
+	// Initialize the Collector server.
+	cpb.RegisterCollectorServer(srv, coll.New(c.tm.Reconnect))
 	// Initialize gNMI Proxy Subscribe server.
-	subscribeSrv, err := subscribe.NewServer(c.cache)
-	if err != nil {
-		return fmt.Errorf("Could not instantiate gNMI server: %v", err)
-	}
+	subscribeSrv, _ := subscribe.NewServer(c.cache)
 	gnmipb.RegisterGNMIServer(srv, subscribeSrv)
 	// Forward streaming updates to clients.
 	c.cache.SetClient(subscribeSrv.Update)
@@ -124,93 +229,57 @@ func runCollector(ctx context.Context) error {
 	go srv.Serve(lis)
 	defer srv.Stop()
 	<-ctx.Done()
+
 	return ctx.Err()
 }
 
-// Container for some of the target state data. It is created once
-// for every device and used as a closure parameter by ProtoHandler.
-type state struct {
-	name   string
-	target *cache.Target
-	// connected status is set to true when the first gnmi notification is received.
-	// it gets reset to false when disconnect call back of ReconnectClient is called.
-	connected bool
+// Struct for managing the dynamic creation of tunnel targets.
+type tunnTarget struct {
+	conf *tpb.Target
+	conn *tunnel.Conn
 }
 
-func (s *state) disconnect() {
-	s.connected = false
-	s.target.Reset()
+type collector struct {
+	cache   *cache.Cache
+	config  *tpb.Configuration
+	tServer *tunnel.Server
+	tm      *manager.Manager
+	cm      *connection.Manager
 }
 
-// handleUpdate parses a protobuf message received from the target. This implementation handles only
-// gNMI SubscribeResponse messages. When the message is an Update, the GnmiUpdate method of the
-// cache.Target is called to generate an update. If the message is a sync_response, then target is
-// marked as synchronised.
-func (s *state) handleUpdate(msg proto.Message) error {
-	if !s.connected {
-		s.target.Connect()
-		s.connected = true
+func (c *collector) add(ctx context.Context, id string, t *tpb.Target, tt *tunnel.Target) error {
+	if t == nil {
+		return fmt.Errorf("cannot add nil target")
 	}
-	resp, ok := msg.(*gnmipb.SubscribeResponse)
+
+	request, ok := c.config.Request[t.GetRequest()]
 	if !ok {
-		return fmt.Errorf("failed to type assert message %#v", msg)
+		return fmt.Errorf("no request found for %s", id)
 	}
-	switch v := resp.Response.(type) {
-	case *gnmipb.SubscribeResponse_Update:
-		s.target.GnmiUpdate(v.Update)
-	case *gnmipb.SubscribeResponse_SyncResponse:
-		s.target.Sync()
-	case *gnmipb.SubscribeResponse_Error:
-		return fmt.Errorf("error in response: %s", v)
-	default:
-		return fmt.Errorf("unknown response %T: %s", v, v)
+
+	// Even though address is not meaningful for tunnel target, the manager uses
+	// `Addresses` for caching/retrieting connectins. Use the target name itself
+	// as the address since target resolution within a tunnel is by target name.
+	if t.GetDialer() == "tunnel" {
+		t.Addresses = []string{id}
+	}
+
+	if err := c.tm.Add(id, t, request); err != nil {
+		return fmt.Errorf("Could not add target %q: %v", id, err)
 	}
 	return nil
 }
 
-type collector struct {
-	cache  *cache.Cache
-	config *targetpb.Configuration
-}
-
 func (c *collector) start(ctx context.Context) {
-	for name, target := range c.config.Target {
-		go func(name string, target *targetpb.Target) {
-			s := &state{name: name, target: c.cache.Add(name)}
-			qr := c.config.Request[target.Request]
-			q, err := client.NewQuery(qr)
-			if err != nil {
-				log.Errorf("NewQuery(%s): %v", qr.String(), err)
-				return
-			}
-			q.Addrs = []string{target.Address}
 
-			if target.Credentials != nil {
-				q.Credentials = &client.Credentials{
-					Username: target.Credentials.Username,
-					Password: target.Credentials.Password,
-				}
-			}
+	for id, t := range c.config.Target {
+		log.Infof("starting target %s", id)
 
-			// TLS is always enabled for a target.
-			q.TLS = &tls.Config{
-				// Today, we assume that we should not verify the certificate from the target.
-				InsecureSkipVerify: true,
-			}
-
-			q.Target = name
-			q.Timeout = *dialTimeout
-			q.ProtoHandler = s.handleUpdate
-			if err := q.Validate(); err != nil {
-				log.Errorf("query.Validate(): %v", err)
-				return
-			}
-			cl := client.Reconnect(&client.BaseClient{}, s.disconnect, nil)
-			if err := cl.Subscribe(ctx, q, gnmiclient.Type); err != nil {
-				log.Errorf("Subscribe failed for target %q: %v", name, err)
-			}
-		}(name, target)
+		if err := c.add(ctx, id, t, nil); err != nil {
+			log.Errorf("failed to add target %q : %v", id, err)
+		}
 	}
+
 }
 
 func main() {

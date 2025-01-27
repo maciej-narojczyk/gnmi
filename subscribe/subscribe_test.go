@@ -17,132 +17,169 @@ limitations under the License.
 package subscribe
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"context"
-	"github.com/golang/protobuf/proto"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/protobuf/proto"
 	"github.com/openconfig/gnmi/cache"
 	"github.com/openconfig/gnmi/client"
 	gnmiclient "github.com/openconfig/gnmi/client/gnmi"
+	"github.com/openconfig/gnmi/ctree"
+	"github.com/openconfig/gnmi/path"
 	"github.com/openconfig/gnmi/testing/fake/testing/grpc/config"
 	"github.com/openconfig/gnmi/value"
 
 	pb "github.com/openconfig/gnmi/proto/gnmi"
 )
 
-func startServer(targets []string) (string, *cache.Cache, func(), error) {
+func startServer(targets []string, opts ...Option) (string, *Server, *cache.Cache, func(), error) {
 	c := cache.New(targets)
-	p, err := NewServer(c)
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("NewServer: %v", err)
-	}
+	p, _ := NewServer(c, opts...)
 	c.SetClient(p.Update)
 	lis, err := net.Listen("tcp", "")
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("net.Listen: %v", err)
+		return "", nil, nil, nil, fmt.Errorf("net.Listen: %v", err)
 	}
 	opt, err := config.WithSelfTLSCert()
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("config.WithSelfCert: %v", err)
+		return "", nil, nil, nil, fmt.Errorf("config.WithSelfCert: %v", err)
 	}
 	srv := grpc.NewServer(opt)
 	pb.RegisterGNMIServer(srv, p)
 	go srv.Serve(lis)
-	return lis.Addr().String(), p.c, func() {
+	return lis.Addr().String(), p, p.c, func() {
 		lis.Close()
 	}, nil
 }
 
-func TestOnce(t *testing.T) {
-	addr, cache, teardown, err := startServer(client.Path{"dev1"})
+func TestOriginInSubscribeRequest(t *testing.T) {
+	addr, _, cache, teardown, err := startServer(client.Path{"dev1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer teardown()
 
 	paths := []client.Path{
-		{"dev1", "a", "b"},
-		{"dev1", "a", "c"},
-		{"dev1", "e", "f"},
-		{"dev1", "f", "b"},
+		{"dev1", "a", "b", "c", "d"},
+		{"dev1", "a", "b", "d", "e"},
+		{"dev1", "a", "c", "d", "e"},
 	}
 	var timestamp time.Time
 	sendUpdates(t, cache, paths, &timestamp)
 
-	testCases := []struct {
-		dev   string
-		query client.Path
-		count int
-		err   bool
+	tests := []struct {
+		desc      string
+		inPrefix  *pb.Path
+		inPath    *pb.Path
+		wantCount int
+		wantErr   bool
 	}{
-		// These cases will be found.
-		{"dev1", client.Path{"a", "b"}, 1, false},
-		{"dev1", client.Path{"a"}, 2, false},
-		{"dev1", client.Path{"e"}, 1, false},
-		{"dev1", client.Path{"*", "b"}, 2, false},
-		// This case is not found.
-		{"dev1", client.Path{"b"}, 0, false},
-		// This target doesn't even exist, and will return an error.
-		{"dev2", client.Path{"a"}, 0, true},
+		{
+			desc:      "no origin set",
+			inPrefix:  &pb.Path{Target: "dev1", Elem: []*pb.PathElem{{Name: "a"}}},
+			inPath:    &pb.Path{Elem: []*pb.PathElem{}},
+			wantCount: 3,
+		},
+		{
+			desc:      "origin set in prefix",
+			inPrefix:  &pb.Path{Target: "dev1", Origin: "a", Elem: []*pb.PathElem{{Name: "b"}}},
+			inPath:    &pb.Path{Elem: []*pb.PathElem{}},
+			wantCount: 2,
+		},
+		{
+			desc:     "origin set in path with path elements in prefix",
+			inPrefix: &pb.Path{Target: "dev1", Elem: []*pb.PathElem{{Name: "a"}}},
+			inPath:   &pb.Path{Origin: "b"},
+			wantErr:  true,
+		},
+		{
+			desc:      "origin set in path",
+			inPrefix:  &pb.Path{Target: "dev1"},
+			inPath:    &pb.Path{Origin: "a", Elem: []*pb.PathElem{{Name: "b"}}},
+			wantCount: 2,
+		},
+		{
+			desc:     "origin set in path and prefix",
+			inPrefix: &pb.Path{Target: "dev1", Origin: "a", Elem: []*pb.PathElem{{Name: "b"}}},
+			inPath:   &pb.Path{Origin: "c"},
+			wantErr:  true,
+		},
 	}
-	for _, tt := range testCases {
-		t.Run(fmt.Sprintf("target: %q query: %q", tt.dev, tt.query), func(t *testing.T) {
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s: prefix %v and path %v", tt.desc, tt.inPrefix, tt.inPath), func(t *testing.T) {
 			sync := 0
 			count := 0
-			q := client.Query{
-				Addrs:   []string{addr},
-				Target:  tt.dev,
-				Queries: []client.Path{tt.query},
-				Type:    client.Once,
-				NotificationHandler: func(n client.Notification) error {
-					switch n.(type) {
-					case client.Update:
-						count++
-					case client.Sync:
-						sync++
-					case client.Connected:
-					default:
-						t.Fatalf("unexpected notification %#v", n)
-					}
-					return nil
+			q, err := client.NewQuery(&pb.SubscribeRequest{
+				Request: &pb.SubscribeRequest_Subscribe{
+					Subscribe: &pb.SubscriptionList{
+						Prefix:       tt.inPrefix,
+						Subscription: []*pb.Subscription{{Path: tt.inPath}},
+						Mode:         pb.SubscriptionList_ONCE,
+					},
 				},
-				TLS: &tls.Config{InsecureSkipVerify: true},
+			})
+			if err != nil {
+				t.Fatalf("failed to initialize a client.Query: %v", err)
 			}
+			q.ProtoHandler = func(msg proto.Message) error {
+				resp, ok := msg.(*pb.SubscribeResponse)
+				if !ok {
+					return fmt.Errorf("failed to type assert message %#v", msg)
+				}
+				switch v := resp.Response.(type) {
+				case *pb.SubscribeResponse_Update:
+					count++
+				case *pb.SubscribeResponse_Error:
+					return fmt.Errorf("error in response: %s", v)
+				case *pb.SubscribeResponse_SyncResponse:
+					sync++
+				default:
+					return fmt.Errorf("unknown response %T: %s", v, v)
+				}
+
+				return nil
+			}
+			q.TLS = &tls.Config{InsecureSkipVerify: true}
+			q.Addrs = []string{addr}
+
 			c := client.BaseClient{}
-			err := c.Subscribe(context.Background(), q, gnmiclient.Type)
+			err = c.Subscribe(context.Background(), q, gnmiclient.Type)
 			defer c.Close()
-			if err != nil && !tt.err {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if err == nil && tt.err {
-				t.Fatal("didn't get expected error")
-			}
-			if tt.err {
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("got nil, want err")
+				}
 				return
+			}
+			if err != nil {
+				t.Fatalf("got %v, want no error", err)
 			}
 			if sync != 1 {
 				t.Errorf("got %d sync messages, want 1", sync)
 			}
-			if count != tt.count {
-				t.Errorf("got %d updates, want %d", count, tt.count)
+			if count != tt.wantCount {
+				t.Errorf("got %d updates, want %d", count, tt.wantCount)
 			}
 		})
 	}
 }
 
 func TestGNMIOnce(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	addr, cache, teardown, err := startServer(client.Path{"dev1"})
+	addr, _, cache, teardown, err := startServer(client.Path{"dev1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,114 +262,34 @@ func TestGNMIOnce(t *testing.T) {
 }
 
 // sendUpdates generates an update for each supplied path incrementing the
-// timestamp for each.
+// timestamp and value for each.
 func sendUpdates(t *testing.T, c *cache.Cache, paths []client.Path, timestamp *time.Time) {
 	t.Helper()
-	switch cache.Type {
-	case cache.ClientLeaf:
-		for _, path := range paths {
-			*timestamp = timestamp.Add(time.Nanosecond)
-			if err := c.Update(client.Update{Path: path, Val: strings.Join(path, "/"), TS: *timestamp}); err != nil {
-				t.Errorf("streamUpdate: %v", err)
-			}
+	for _, path := range paths {
+		*timestamp = timestamp.Add(time.Nanosecond)
+		sv, err := value.FromScalar(timestamp.UnixNano())
+		if err != nil {
+			t.Errorf("Scalar value err %v", err)
+			continue
 		}
-	case cache.GnmiNoti:
-		for _, path := range paths {
-			*timestamp = timestamp.Add(time.Nanosecond)
-			sv, err := value.FromScalar(strings.Join(path, "/"))
-			if err != nil {
-				t.Errorf("Scalar value err %v", err)
-				continue
-			}
-			noti := &pb.Notification{
-				Prefix:    &pb.Path{Target: path[0]},
-				Timestamp: timestamp.UnixNano(),
-				Update: []*pb.Update{
-					{
-						Path: &pb.Path{Element: path[1:]},
-						Val:  sv,
-					},
+		noti := &pb.Notification{
+			Prefix:    &pb.Path{Target: path[0]},
+			Timestamp: timestamp.UnixNano(),
+			Update: []*pb.Update{
+				{
+					Path: &pb.Path{Element: path[1:]},
+					Val:  sv,
 				},
-			}
-			if err := c.GnmiUpdate(noti); err != nil {
-				t.Errorf("streamUpdate: %v", err)
-			}
+			},
 		}
-	}
-}
-
-func TestPoll(t *testing.T) {
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
-
-	paths := []client.Path{
-		{"dev1", "a", "b"},
-		{"dev1", "a", "c"},
-		{"dev1", "e", "f"},
-		{"dev2", "a", "b"},
-	}
-	var timestamp time.Time
-	sendUpdates(t, cache, paths, &timestamp)
-
-	// The streaming Updates change only the timestamp, so the value is used as
-	// a key.
-	m := map[string]time.Time{}
-	sync := 0
-	count := 0
-	c := client.BaseClient{}
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Poll,
-		NotificationHandler: func(n client.Notification) error {
-			switch u := n.(type) {
-			case client.Update:
-				count++
-				v, ts := u.Val.(string), u.TS
-				want1, want2 := "dev1/a/b", "dev1/a/c"
-				if v != want1 && v != want2 {
-					t.Fatalf("#%d: got %q, want one of (%q, %q)", count, v, want1, want2)
-				}
-				if ts.Before(m[v]) {
-					t.Fatalf("#%d: got timestamp %s, want >= %s for value %q", count, ts, m[v], v)
-				}
-				m[v] = ts
-			case client.Sync:
-				if count != 2 {
-					t.Fatalf("did not receive initial updates before sync, got %d, want 2", count)
-				}
-				count = 0
-				sync++
-				if sync == 3 {
-					c.Close()
-				} else {
-					sendUpdates(t, cache, paths, &timestamp)
-					c.Poll()
-				}
-			case client.Connected:
-			default:
-				t.Fatalf("#%d: unexpected notification %#v", count, n)
-			}
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-	err = c.Subscribe(context.Background(), q, gnmiclient.Type)
-	if err != nil {
-		t.Error(err)
+		if err := c.GnmiUpdate(noti); err != nil {
+			t.Errorf("streamUpdate: %v", err)
+		}
 	}
 }
 
 func TestGNMIPoll(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
+	addr, _, cache, teardown, err := startServer([]string{"dev1", "dev2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,16 +323,8 @@ func TestGNMIPoll(t *testing.T) {
 			switch r := resp.Response.(type) {
 			case *pb.SubscribeResponse_Update:
 				count++
-				sv, err := value.ToScalar(r.Update.Update[0].Val)
-				if err != nil {
-					t.Errorf("typed value to scalar value conversion failed: %v", err)
-				}
-				v := sv.(string)
 				ts := time.Unix(0, r.Update.GetTimestamp())
-				want1, want2 := "dev1/a/b", "dev1/a/c"
-				if v != want1 && v != want2 {
-					t.Fatalf("#%d: got %q, want one of (%q, %q)", count, v, want1, want2)
-				}
+				v := strings.Join(path.ToStrings(r.Update.Update[0].Path, false), "/")
 				if ts.Before(m[v]) {
 					t.Fatalf("#%d: got timestamp %s, want >= %s for value %q", count, ts, m[v], v)
 				}
@@ -407,83 +356,8 @@ func TestGNMIPoll(t *testing.T) {
 	}
 }
 
-func TestStream(t *testing.T) {
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
-
-	paths := []client.Path{
-		{"dev1", "a", "b"},
-		{"dev1", "a", "c"},
-		{"dev1", "e", "f"},
-		{"dev2", "a", "b"},
-	}
-	var timestamp time.Time
-	sendUpdates(t, cache, paths, &timestamp)
-
-	// The streaming Updates change only the timestamp, so the value is used as
-	// a key.
-	m := map[string]time.Time{}
-	sync := false
-	count := 0
-	c := client.BaseClient{}
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		NotificationHandler: func(n client.Notification) error {
-			switch u := n.(type) {
-			case client.Update:
-				count++
-				// The total updates received should be 4, 2 before sync, 2 after.
-				if count == 4 {
-					c.Close()
-				}
-				v, ts := u.Val.(string), u.TS
-				want1, want2 := "dev1/a/b", "dev1/a/c"
-				if v != want1 && v != want2 {
-					t.Fatalf("#%d: got %q, want one of (%q, %q)", count, v, want1, want2)
-				}
-				if ts.Before(m[v]) {
-					t.Fatalf("#%d: got timestamp %s, want >= %s for value %q", count, ts, m[v], v)
-				}
-				m[v] = ts
-			case client.Sync:
-				if sync {
-					t.Fatal("received more than one sync message")
-				}
-				if count < 2 {
-					t.Fatalf("did not receive initial updates before sync, got %d, want > 2", count)
-				}
-				sync = true
-				// Send some updates after the sync occurred.
-				sendUpdates(t, cache, paths, &timestamp)
-			case client.Connected:
-			default:
-				t.Fatalf("#%d: unexpected notification %#v", count, n)
-			}
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-	err = c.Subscribe(context.Background(), q, gnmiclient.Type)
-	if err != nil {
-		t.Error(err)
-	}
-	if !sync {
-		t.Error("streaming query did not send sync message")
-	}
-}
-
 func TestGNMIStream(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
+	addr, _, cache, teardown, err := startServer([]string{"dev1", "dev2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,8 +372,6 @@ func TestGNMIStream(t *testing.T) {
 	var timestamp time.Time
 	sendUpdates(t, cache, paths, &timestamp)
 
-	// The streaming Updates change only the timestamp, so the value is used as
-	// a key.
 	m := map[string]time.Time{}
 	sync := false
 	count := 0
@@ -521,16 +393,8 @@ func TestGNMIStream(t *testing.T) {
 				if count == 4 {
 					c.Close()
 				}
-				sv, err := value.ToScalar(r.Update.Update[0].Val)
-				if err != nil {
-					t.Errorf("typed value to scalar value conversion failed: %v", err)
-				}
-				v := sv.(string)
+				v := strings.Join(path.ToStrings(r.Update.Update[0].Path, false), "/")
 				ts := time.Unix(0, r.Update.GetTimestamp())
-				want1, want2 := "dev1/a/b", "dev1/a/c"
-				if v != want1 && v != want2 {
-					t.Fatalf("#%d: got %q, want one of (%q, %q)", count, v, want1, want2)
-				}
 				if ts.Before(m[v]) {
 					t.Fatalf("#%d: got timestamp %s, want >= %s for value %q", count, ts, m[v], v)
 				}
@@ -563,91 +427,55 @@ func TestGNMIStream(t *testing.T) {
 	}
 }
 
-func TestStreamNewUpdates(t *testing.T) {
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
-	if err != nil {
-		t.Fatal(err)
+func atomicNotification(prefix client.Path, paths []client.Path, values []int64, timestamp time.Time) *pb.Notification {
+	n := len(paths)
+	if n != len(values) {
+		return nil
 	}
-	defer teardown()
-
-	paths := []client.Path{
-		{"dev1", "e", "f"},
-		{"dev2", "a", "b"},
-	}
-	var timestamp time.Time
-	sendUpdates(t, cache, paths, &timestamp)
-
-	newpaths := []client.Path{
-		{"dev1", "b", "d"},
-		{"dev2", "a", "x"},
-		{"dev1", "a", "x"}, // The update we want to see.
-	}
-
-	sync := false
-	c := client.BaseClient{}
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		NotificationHandler: func(n client.Notification) error {
-			switch u := n.(type) {
-			case client.Update:
-				v, want := u.Val.(string), "dev1/a/x"
-				if v != want {
-					t.Fatalf("got update %q, want only %q", v, want)
-				}
-				c.Close()
-			case client.Sync:
-				if sync {
-					t.Fatal("received more than one sync message")
-				}
-				sync = true
-				// Stream new updates only after sync which should have had 0
-				// updates.
-				sendUpdates(t, cache, newpaths, &timestamp)
-			case client.Connected:
-			default:
-				t.Fatalf("unexpected notification %#v", n)
-			}
+	us := make([]*pb.Update, 0, n)
+	for i, path := range paths {
+		sv, err := value.FromScalar(values[i])
+		if err != nil {
 			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
+		}
+		us = append(us, &pb.Update{
+			Path: &pb.Path{Element: path},
+			Val:  sv,
+		})
 	}
-	err = c.Subscribe(context.Background(), q, gnmiclient.Type)
-	if err != nil {
-		t.Error(err)
-	}
-	if !sync {
-		t.Error("streaming query did not send sync message")
+	return &pb.Notification{
+		Prefix:    &pb.Path{Target: prefix[0], Element: prefix[1:]},
+		Timestamp: timestamp.UnixNano(),
+		Update:    us,
+		Atomic:    true,
 	}
 }
 
-func TestGNMIStreamNewUpdates(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
+// sendNotification sends a notification.
+func sendNotification(t *testing.T, c *cache.Cache, n *pb.Notification) {
+	t.Helper()
+	if err := c.GnmiUpdate(n); err != nil {
+		t.Errorf("sendNotification: %v", err)
+	}
+}
+
+func TestGNMIStreamAtomic(t *testing.T) {
+	addr, _, cache, teardown, err := startServer([]string{"dev1", "dev2"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer teardown()
 
-	paths := []client.Path{
-		{"dev1", "e", "f"},
-		{"dev2", "a", "b"},
-	}
-	var timestamp time.Time
-	sendUpdates(t, cache, paths, &timestamp)
+	prefix := []string{"dev1", "a"}
+	paths := []client.Path{{"b"}, {"c"}, {"d"}}
+	n1 := atomicNotification(prefix, paths, []int64{1, 2, 3}, time.Unix(12345678900, 0))
+	n2 := atomicNotification(prefix, paths, []int64{4, 5, 6}, time.Unix(12345678930, 0))
+	n3 := atomicNotification(prefix, paths, []int64{7, 8, 9}, time.Unix(12345678960, 0))
+	sendNotification(t, cache, n1)
 
-	newpaths := []client.Path{
-		{"dev1", "b", "d"},
-		{"dev2", "a", "x"},
-		{"dev1", "a", "x"}, // The update we want to see.
-	}
-
+	ns := []*pb.Notification{}
 	sync := false
+	var count int32
 	c := client.BaseClient{}
 	q := client.Query{
 		Addrs:   []string{addr},
@@ -661,23 +489,26 @@ func TestGNMIStreamNewUpdates(t *testing.T) {
 			}
 			switch r := resp.Response.(type) {
 			case *pb.SubscribeResponse_Update:
-				sv, err := value.ToScalar(r.Update.Update[0].Val)
-				if err != nil {
-					t.Errorf("typed value to scalar value conversion failed: %v", err)
+				ns = append(ns, resp.GetUpdate())
+				// The total updates received should be 3, 1 before sync, 2 after.
+				if atomic.AddInt32(&count, 1) == 3 {
+					c.Close()
 				}
-				v, want := sv.(string), "dev1/a/x"
-				if v != want {
-					t.Fatalf("got update %q, want only %q", v, want)
-				}
-				c.Close()
+			case *pb.SubscribeResponse_Error:
+				return fmt.Errorf("error in response: %s", r)
 			case *pb.SubscribeResponse_SyncResponse:
 				if sync {
 					t.Fatal("received more than one sync message")
 				}
+				if x := atomic.LoadInt32(&count); x != 1 {
+					t.Fatalf("initial updates before sync, got %d, want 1", x)
+				}
 				sync = true
-				// Stream new updates only after sync which should have had 0
-				// updates.
-				sendUpdates(t, cache, newpaths, &timestamp)
+				// Send some updates after the sync occurred.
+				sendNotification(t, cache, n2)
+				time.AfterFunc(time.Second, func() {
+					sendNotification(t, cache, n3)
+				})
 			default:
 				return fmt.Errorf("unknown response %T: %s", r, r)
 			}
@@ -687,64 +518,134 @@ func TestGNMIStreamNewUpdates(t *testing.T) {
 	}
 	err = c.Subscribe(context.Background(), q, gnmiclient.Type)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	if !sync {
-		t.Error("streaming query did not send sync message")
+		t.Fatal("streaming query did not send sync message")
+	}
+	if len(ns) != 3 {
+		t.Fatalf("number of notifications received: got %d, want 3", len(ns))
+	}
+	for i, n := range []*pb.Notification{n1, n2, n3} {
+		if diff := cmp.Diff(n, ns[i], cmp.Comparer(proto.Equal)); diff != "" {
+			t.Errorf("diff in received notification %d:\n%s", i+1, diff)
+		}
 	}
 }
 
-func TestUpdatesOnly(t *testing.T) {
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
+func TestGNMIStreamNewUpdates(t *testing.T) {
+	defaultToSubscribeRequest := gnmiclient.ToSubscribeRequest
+	defer func() {
+		gnmiclient.ToSubscribeRequest = defaultToSubscribeRequest
+	}()
+	addr, _, cache, teardown, err := startServer([]string{"dev1", "dev2"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer teardown()
 
 	paths := []client.Path{
-		{"dev1", "a", "b"},
+		{"dev1", "e", "f"},
+		{"dev2", "a", "b", "c"},
 	}
-	var timestamp time.Time
-	sendUpdates(t, cache, paths, &timestamp)
+	newpaths := []client.Path{
+		{"dev1", "b", "d"},
+		{"dev2", "a", "b", "x"},
+		{"dev1", "a", "b", "x"}, // The update we want to see.
+	}
 
-	sync := false
-	c := client.BaseClient{}
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		NotificationHandler: func(n client.Notification) error {
-			switch u := n.(type) {
-			case client.Update:
-				if !sync {
-					t.Errorf("got update %v before sync", u)
-				}
-				c.Close()
-			case client.Sync:
-				sync = true
-				sendUpdates(t, cache, paths, &timestamp)
-			case client.Connected:
-			default:
-				t.Fatalf("unexpected notification %#v", n)
-			}
-			return nil
+	tests := []struct {
+		desc  string
+		toSub func(q client.Query) (*pb.SubscribeRequest, error)
+	}{{
+		desc:  "default - no origin in request",
+		toSub: defaultToSubscribeRequest,
+	}, {
+		desc: "origin in prefix",
+		toSub: func(q client.Query) (*pb.SubscribeRequest, error) {
+			return &pb.SubscribeRequest{
+				Request: &pb.SubscribeRequest_Subscribe{
+					Subscribe: &pb.SubscriptionList{
+						Prefix: &pb.Path{Target: q.Target, Origin: "a"},
+						Subscription: []*pb.Subscription{{
+							Path: &pb.Path{Elem: []*pb.PathElem{{Name: "b"}}},
+						}},
+					},
+				},
+			}, nil
 		},
-		TLS:         &tls.Config{InsecureSkipVerify: true},
-		UpdatesOnly: true,
-	}
-	err = c.Subscribe(context.Background(), q, gnmiclient.Type)
-	if err != nil {
-		t.Error(err)
+	}, {
+		desc: "origin in subscription path",
+		toSub: func(q client.Query) (*pb.SubscribeRequest, error) {
+			return &pb.SubscribeRequest{
+				Request: &pb.SubscribeRequest_Subscribe{
+					Subscribe: &pb.SubscriptionList{
+						Prefix: &pb.Path{Target: q.Target},
+						Subscription: []*pb.Subscription{{
+							Path: &pb.Path{
+								Origin: "a",
+								Elem:   []*pb.PathElem{{Name: "b"}},
+							},
+						}},
+					},
+				},
+			}, nil
+		},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			cache.Reset("dev1")
+			cache.Reset("dev2")
+			var timestamp time.Time
+			sendUpdates(t, cache, paths, &timestamp)
+			gnmiclient.ToSubscribeRequest = tt.toSub
+			sync := false
+			c := client.BaseClient{}
+			q := client.Query{
+				Addrs:   []string{addr},
+				Target:  "dev1",
+				Queries: []client.Path{{"a", "b"}},
+				Type:    client.Stream,
+				ProtoHandler: func(msg proto.Message) error {
+					resp, ok := msg.(*pb.SubscribeResponse)
+					if !ok {
+						return fmt.Errorf("failed to type assert message %#v", msg)
+					}
+					switch r := resp.Response.(type) {
+					case *pb.SubscribeResponse_Update:
+						v, want := strings.Join(path.ToStrings(r.Update.Update[0].Path, false), "/"), "a/b/x"
+						if v != want {
+							t.Fatalf("got update %q, want only %q", v, want)
+						}
+						c.Close()
+					case *pb.SubscribeResponse_SyncResponse:
+						if sync {
+							t.Fatal("received more than one sync message")
+						}
+						sync = true
+						// Stream new updates only after sync which should have had 0
+						// updates.
+						sendUpdates(t, cache, newpaths, &timestamp)
+					default:
+						return fmt.Errorf("unknown response %T: %s", r, r)
+					}
+					return nil
+				},
+				TLS: &tls.Config{InsecureSkipVerify: true},
+			}
+			err = c.Subscribe(context.Background(), q, gnmiclient.Type)
+			if err != nil {
+				t.Error(err)
+			}
+			if !sync {
+				t.Error("streaming query did not send sync message")
+			}
+		})
 	}
 }
 
 func TestGNMIUpdatesOnly(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
+	addr, _, cache, teardown, err := startServer([]string{"dev1", "dev2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -793,86 +694,8 @@ func TestGNMIUpdatesOnly(t *testing.T) {
 
 // If a client doesn't read any of the responses, it should not affect other
 // clients querying the same target.
-func TestSubscribeUnresponsiveClient(t *testing.T) {
-	addr, cache, teardown, err := startServer([]string{"dev1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
-
-	paths := []client.Path{
-		{"dev1", "a", "b"},
-		{"dev1", "a", "c"},
-		{"dev1", "e", "f"},
-	}
-	sendUpdates(t, cache, paths, &time.Time{})
-
-	// Start the first client and do *not* read any responses.
-	started := make(chan struct{})
-	stall := make(chan struct{})
-	defer close(stall)
-	client1 := client.BaseClient{}
-	defer client1.Close()
-	q1 := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		NotificationHandler: func(n client.Notification) error {
-			select {
-			case <-started:
-			default:
-				close(started)
-			}
-			<-stall
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-	ctx := context.Background()
-	go client1.Subscribe(ctx, q1, gnmiclient.Type)
-	// Wait for client1 to start.
-	<-started
-
-	// Start the second client for the same target and actually accept
-	// responses.
-	count := 0
-	client2 := client.BaseClient{}
-	q2 := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		NotificationHandler: func(n client.Notification) error {
-			switch n.(type) {
-			case client.Update:
-				count++
-			case client.Sync:
-				client2.Close()
-			case client.Connected:
-			default:
-				t.Fatalf("unexpected notification %#v", n)
-			}
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-	if err := client2.Subscribe(ctx, q2, gnmiclient.Type); err != nil {
-		t.Errorf("client2.Subscribe: %v", err)
-	}
-	if count != 2 {
-		t.Errorf("client2.Subscribe got %d updates, want 2", count)
-	}
-}
-
-// If a client doesn't read any of the responses, it should not affect other
-// clients querying the same target.
 func TestGNMISubscribeUnresponsiveClient(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	addr, cache, teardown, err := startServer([]string{"dev1"})
+	addr, _, cache, teardown, err := startServer([]string{"dev1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -914,7 +737,7 @@ func TestGNMISubscribeUnresponsiveClient(t *testing.T) {
 
 	// Start the second client for the same target and actually accept
 	// responses.
-	count := 0
+	var count int32
 	client2 := client.BaseClient{}
 	q2 := client.Query{
 		Addrs:   []string{addr},
@@ -928,7 +751,7 @@ func TestGNMISubscribeUnresponsiveClient(t *testing.T) {
 			}
 			switch r := resp.Response.(type) {
 			case *pb.SubscribeResponse_Update:
-				count++
+				atomic.AddInt32(&count, 1)
 			case *pb.SubscribeResponse_SyncResponse:
 				client2.Close()
 			default:
@@ -946,62 +769,8 @@ func TestGNMISubscribeUnresponsiveClient(t *testing.T) {
 	}
 }
 
-func TestDeletedTargetMessage(t *testing.T) {
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
-
-	paths := []client.Path{
-		{"dev1", "a", "b"},
-		{"dev1", "a", "c"},
-		{"dev1", "e", "f"},
-		{"dev2", "a", "b"},
-	}
-	sendUpdates(t, cache, paths, &time.Time{})
-
-	deleted := false
-	c := client.BaseClient{}
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		NotificationHandler: func(n client.Notification) error {
-			switch v := n.(type) {
-			case client.Update:
-			case client.Sync:
-				cache.Remove("dev1")
-			case client.Delete:
-				// Want to see a target delete message.  No need to call c.Close()
-				// because the server should close the connection if the target is
-				// removed.
-				if len(v.Path) == 1 && v.Path[0] == "dev1" {
-					deleted = true
-				}
-			case client.Connected:
-			default:
-				t.Fatalf("unexpected notification %#v", n)
-			}
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-	if err := c.Subscribe(context.Background(), q, gnmiclient.Type); err != nil {
-		t.Errorf("c.Subscribe: %v", err)
-	}
-	if !deleted {
-		t.Error("Target delete not sent.")
-	}
-}
-
 func TestGNMIDeletedTargetMessage(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	addr, ch, teardown, err := startServer([]string{"dev1", "dev2"})
+	addr, _, ch, teardown, err := startServer([]string{"dev1", "dev2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1054,114 +823,7 @@ func TestGNMIDeletedTargetMessage(t *testing.T) {
 	}
 }
 
-func TestCoalescedDupCount(t *testing.T) {
-	// Inject a simulated flow control to block sends and induce coalescing.
-	flowControlTest = func() { time.Sleep(100 * time.Microsecond) }
-	addr, cache, teardown, err := startServer([]string{"dev1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
-
-	stall := make(chan struct{})
-	done := make(chan struct{})
-	coalesced := uint32(0)
-	count := 0
-	c := client.BaseClient{}
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		NotificationHandler: func(n client.Notification) error {
-			switch u := n.(type) {
-			case client.Update:
-				count++
-				if u.Dups > 0 {
-					coalesced = u.Dups
-				}
-				switch count {
-				case 1:
-					close(stall)
-				case 2:
-					close(done)
-				}
-			}
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go c.Subscribe(ctx, q, gnmiclient.Type)
-
-	paths := []client.Path{
-		{"dev1", "a"},
-		{"dev1", "a"},
-		{"dev1", "a"},
-		{"dev1", "a"},
-		{"dev1", "a"},
-	}
-	var timestamp time.Time
-	sendUpdates(t, cache, paths[0:1], &timestamp)
-	<-stall
-	sendUpdates(t, cache, paths, &timestamp)
-	<-done
-
-	if want := uint32(len(paths) - 1); coalesced != want {
-		t.Errorf("got coalesced count %d, want %d", coalesced, want)
-	}
-}
-
 func TestGNMICoalescedDupCount(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	// Inject a simulated flow control to block sends and induce coalescing.
-	flowControlTest = func() { time.Sleep(100 * time.Microsecond) }
-	addr, cache, teardown, err := startServer([]string{"dev1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
-
-	stall := make(chan struct{})
-	done := make(chan struct{})
-	coalesced := uint32(0)
-	count := 0
-	c := client.BaseClient{}
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		ProtoHandler: func(msg proto.Message) error {
-			resp, ok := msg.(*pb.SubscribeResponse)
-			if !ok {
-				return fmt.Errorf("failed to type assert message %#v", msg)
-			}
-			switch r := resp.Response.(type) {
-			case *pb.SubscribeResponse_Update:
-				count++
-				if r.Update.Update[0].GetDuplicates() > 0 {
-					coalesced = r.Update.Update[0].GetDuplicates()
-				}
-				switch count {
-				case 1:
-					close(stall)
-				case 2:
-					close(done)
-				}
-			}
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go c.Subscribe(ctx, q, gnmiclient.Type)
-
 	paths := []client.Path{
 		{"dev1", "a"},
 		{"dev1", "a"},
@@ -1169,74 +831,128 @@ func TestGNMICoalescedDupCount(t *testing.T) {
 		{"dev1", "a"},
 		{"dev1", "a"},
 	}
-	var timestamp time.Time
-	sendUpdates(t, cache, paths[0:1], &timestamp)
-	<-stall
-	sendUpdates(t, cache, paths, &timestamp)
-	<-done
+	for _, tt := range []struct {
+		desc       string
+		opts       []Option
+		want       int64
+		wantReport uint32
+	}{{
+		desc:       "report coalesced",
+		opts:       []Option{WithStats()},
+		want:       int64(len(paths) - 1),
+		wantReport: uint32(len(paths) - 1),
+	}, {
+		desc:       "don't report coalesced",
+		opts:       []Option{WithStats(), WithoutDupReport()},
+		want:       int64(len(paths) - 1),
+		wantReport: 0,
+	}} {
+		t.Run(tt.desc, func(t *testing.T) {
+			// Inject a simulated flow control to block sends and induce coalescing.
+			var dequeCount int32
+			qszReady := make(chan struct{})
+			dupReady := make(chan struct{})
+			qszWait := make(chan struct{})
+			dupWait := make(chan struct{})
+			clientStatsTest := func(dup, qsz int64) {
+				atomic.AddInt32(&dequeCount, 1)
+				if qsz > 0 {
+					close(qszReady)
+					<-qszWait
+				}
+				if dup > 0 {
+					close(dupReady)
+					<-dupWait
+				}
+			}
+			flowControlTest := func() { time.Sleep(10 * time.Millisecond) }
+			opts := append(tt.opts, WithFlowControlTest(flowControlTest))
+			opts = append(opts, WithClientStatsTest(clientStatsTest))
+			addr, s, cache, teardown, err := startServer([]string{"dev1"}, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer teardown()
 
-	if want := uint32(len(paths) - 1); coalesced != want {
-		t.Errorf("got coalesced count %d, want %d", coalesced, want)
-	}
-}
+			stall := make(chan struct{})
+			done := make(chan struct{})
+			coalesced := uint32(0)
+			var count int32
+			c := client.BaseClient{}
+			q := client.Query{
+				Addrs:   []string{addr},
+				Target:  "dev1",
+				Queries: []client.Path{{"a"}},
+				Type:    client.Stream,
+				ProtoHandler: func(msg proto.Message) error {
+					resp, ok := msg.(*pb.SubscribeResponse)
+					if !ok {
+						return fmt.Errorf("failed to type assert message %#v", msg)
+					}
+					switch r := resp.Response.(type) {
+					case *pb.SubscribeResponse_Update:
+						atomic.AddInt32(&count, 1)
+						if r.Update.Update[0].GetDuplicates() > 0 {
+							coalesced = r.Update.Update[0].GetDuplicates()
+						}
+						switch atomic.LoadInt32(&count) {
+						case 1:
+							close(stall)
+						case 2:
+							close(done)
+						}
+					}
+					return nil
+				},
+				TLS: &tls.Config{InsecureSkipVerify: true},
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go c.Subscribe(ctx, q, gnmiclient.Type)
 
-func TestSubscribeTimeout(t *testing.T) {
-	// Set a low timeout that is below the induced flowControl delay.
-	Timeout = 100 * time.Millisecond
-	// Cause query to hang indefinitely to induce timeout.
-	flowControlTest = func() { select {} }
-	// Reset the global variables so as not to interfere with other tests.
-	defer func() {
-		Timeout = time.Minute
-		flowControlTest = func() {}
-	}()
+			var timestamp time.Time
+			sendUpdates(t, cache, paths[0:1], &timestamp)
+			<-qszReady
+			for _, st := range s.ClientStats() {
+				if st.QueueSize != 1 { // Sync is in the queue
+					t.Errorf("QueueSize: got %d, want 1", st.QueueSize)
+				}
+			}
+			close(qszWait)
+			<-stall
 
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
+			sendUpdates(t, cache, paths, &timestamp)
+			<-dupReady
+			for _, st := range s.ClientStats() {
+				if st.CoalesceCount != tt.want {
+					t.Errorf("CoalesceCount: got %d, want %d", st.CoalesceCount, tt.want)
+				}
+			}
+			close(dupWait)
+			<-done
 
-	paths := []client.Path{
-		{"dev1", "a", "b"},
-		{"dev1", "a", "c"},
-		{"dev1", "e", "f"},
-		{"dev2", "a", "b"},
-	}
-	sendUpdates(t, cache, paths, &time.Time{})
-
-	c := client.BaseClient{}
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Stream,
-		NotificationHandler: func(n client.Notification) error {
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-	if err := c.Subscribe(context.Background(), q, gnmiclient.Type); err == nil {
-		t.Error("c.Subscribe got nil, wanted a timeout err")
+			if coalesced != tt.wantReport {
+				t.Errorf("got coalesced count %d, want %d", coalesced, tt.wantReport)
+			}
+		})
 	}
 }
 
 func TestGNMISubscribeTimeout(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	// Set a low timeout that is below the induced flowControl delay.
-	Timeout = 100 * time.Millisecond
-	// Cause query to hang indefinitely to induce timeout.
-	flowControlTest = func() { select {} }
-	// Reset the global variables so as not to interfere with other tests.
-	defer func() {
-		Timeout = time.Minute
-		flowControlTest = func() {}
-	}()
+	stall := make(chan struct{})
+	defer close(stall)
+	opts := []Option{
+		// Set a low timeout that is below the induced flowControl delay.
+		WithTimeout(100 * time.Millisecond),
+		// Cause query to hang indefinitely to induce timeout.
+		WithFlowControlTest(func() {
+			select {
+			case <-stall:
+			}
+		}),
+	}
 
-	addr, cache, teardown, err := startServer([]string{"dev1", "dev2"})
+	addr, _, cache, teardown, err := startServer([]string{"dev1", "dev2"}, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1266,164 +982,9 @@ func TestGNMISubscribeTimeout(t *testing.T) {
 	}
 }
 
-func TestSubscriptionLimit(t *testing.T) {
-	totalQueries := 20
-	SubscriptionLimit = 7
-	causeLimit := make(chan struct{})
-	subscriptionLimitTest = func() {
-		<-causeLimit
-	}
-	// Clear the global variables so as not to interfere with other tests.
-	defer func() {
-		SubscriptionLimit = 0
-		subscriptionLimitTest = func() {}
-	}()
-
-	addr, _, teardown, err := startServer([]string{"dev1", "dev2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
-
-	fc := make(chan struct{})
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Once,
-		NotificationHandler: func(n client.Notification) error {
-			switch n.(type) {
-			case client.Sync:
-				fc <- struct{}{}
-			}
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-
-	// Launch parallel queries.
-	for i := 0; i < totalQueries; i++ {
-		c := client.BaseClient{}
-		go c.Subscribe(context.Background(), q, gnmiclient.Type)
-	}
-
-	timeout := time.After(500 * time.Millisecond)
-	finished := 0
-firstQueries:
-	for {
-		select {
-		case <-fc:
-			finished++
-		case <-timeout:
-			break firstQueries
-		}
-	}
-	if finished != SubscriptionLimit {
-		t.Fatalf("got %d finished queries, want %d", finished, SubscriptionLimit)
-	}
-
-	close(causeLimit)
-	timeout = time.After(time.Second)
-remainingQueries:
-	for {
-		select {
-		case <-fc:
-			if finished++; finished == totalQueries {
-				break remainingQueries
-			}
-		case <-timeout:
-			t.Errorf("Remaining queries did not proceed after limit removed. got %d, want %d", finished, totalQueries)
-		}
-	}
-}
-
-func TestGNMISubscriptionLimit(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
-	totalQueries := 20
-	SubscriptionLimit = 7
-	causeLimit := make(chan struct{})
-	subscriptionLimitTest = func() {
-		<-causeLimit
-	}
-	// Clear the global variables so as not to interfere with other tests.
-	defer func() {
-		SubscriptionLimit = 0
-		subscriptionLimitTest = func() {}
-	}()
-
-	addr, _, teardown, err := startServer([]string{"dev1", "dev2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown()
-
-	fc := make(chan struct{})
-	q := client.Query{
-		Addrs:   []string{addr},
-		Target:  "dev1",
-		Queries: []client.Path{{"a"}},
-		Type:    client.Once,
-		ProtoHandler: func(msg proto.Message) error {
-			resp, ok := msg.(*pb.SubscribeResponse)
-			if !ok {
-				return fmt.Errorf("failed to type assert message %#v", msg)
-			}
-			switch resp.Response.(type) {
-			case *pb.SubscribeResponse_SyncResponse:
-				fc <- struct{}{}
-			}
-			return nil
-		},
-		TLS: &tls.Config{InsecureSkipVerify: true},
-	}
-
-	// Launch parallel queries.
-	for i := 0; i < totalQueries; i++ {
-		c := client.BaseClient{}
-		go c.Subscribe(context.Background(), q, gnmiclient.Type)
-	}
-
-	timeout := time.After(500 * time.Millisecond)
-	finished := 0
-firstQueries:
-	for {
-		select {
-		case <-fc:
-			finished++
-		case <-timeout:
-			break firstQueries
-		}
-	}
-	if finished != SubscriptionLimit {
-		t.Fatalf("got %d finished queries, want %d", finished, SubscriptionLimit)
-	}
-
-	close(causeLimit)
-	timeout = time.After(time.Second)
-remainingQueries:
-	for {
-		select {
-		case <-fc:
-			if finished++; finished == totalQueries {
-				break remainingQueries
-			}
-		case <-timeout:
-			t.Errorf("Remaining queries did not proceed after limit removed. got %d, want %d", finished, totalQueries)
-		}
-	}
-}
-
 func TestGNMIMultipleSubscriberCoalescion(t *testing.T) {
-	cache.Type = cache.GnmiNoti
-	defer func() {
-		cache.Type = cache.ClientLeaf
-	}()
 	// Inject a simulated flow control to block sends and induce coalescing.
-	flowControlTest = func() { time.Sleep(time.Second) }
-	addr, cache, teardown, err := startServer([]string{"dev1"})
+	addr, _, cache, teardown, err := startServer([]string{"dev1"}, WithFlowControlTest(func() { time.Sleep(time.Second) }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1477,5 +1038,432 @@ func TestGNMIMultipleSubscriberCoalescion(t *testing.T) {
 		if d != uint32(len(paths)-1) {
 			t.Errorf("#%d got %d, expect %d duplicate count", i, d, uint32(len(paths)-1))
 		}
+	}
+}
+
+func TestGNMIServerStats(t *testing.T) {
+	ready1 := make(chan struct{})
+	ready2 := make(chan struct{})
+	ready3 := make(chan struct{})
+	subsEnterCount := 0
+	updateSubsCountEnterTest := func() {
+		subsEnterCount++
+		switch subsEnterCount {
+		case 1:
+			close(ready1)
+		case 2:
+			close(ready2)
+		case 3:
+			close(ready3)
+		}
+	}
+	wait1 := make(chan struct{})
+	wait2 := make(chan struct{})
+	wait3 := make(chan struct{})
+	subsExitCount := 0
+	updateSubsCountExitTest := func() {
+		subsExitCount++
+		switch subsExitCount {
+		case 1:
+			close(wait1)
+		case 2:
+			close(wait2)
+		case 3:
+			close(wait3)
+		}
+	}
+	opts := []Option{
+		WithStats(),
+		WithUpdateSubsCountEnterTest(updateSubsCountEnterTest),
+		WithUpdateSubsCountExitTest(updateSubsCountExitTest),
+	}
+	addr, s, cache, teardown, err := startServer([]string{"dev1", "dev2"}, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer teardown()
+
+	paths := []client.Path{
+		{"dev1", "a", "b"},
+		{"dev2", "a", "b"},
+	}
+	var timestamp time.Time
+	sendUpdates(t, cache, paths, &timestamp)
+
+	c1 := client.BaseClient{}
+	q := client.Query{
+		Addrs:   []string{addr},
+		Target:  "dev1",
+		Queries: []client.Path{{"a"}},
+		Type:    client.Stream,
+		ProtoHandler: func(proto.Message) error {
+			return nil
+		},
+		TLS: &tls.Config{InsecureSkipVerify: true},
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	go func() {
+		c1.Subscribe(ctx1, q, gnmiclient.Type)
+	}()
+	<-ready1
+	checkSubsCounts(t, "one stream client to dev1",
+		s.TypeStats(), map[string]TypeStats{"stream": TypeStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1}},
+		s.TargetStats(), map[string]TargetStats{"dev1": TargetStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1}})
+
+	c2 := client.BaseClient{}
+	q.Target = "dev2"
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	go func() {
+		c2.Subscribe(ctx2, q, gnmiclient.Type)
+	}()
+	<-ready2
+	checkSubsCounts(t, "one stream client to dev1 + one stream client to dev2",
+		s.TypeStats(), map[string]TypeStats{"stream": TypeStats{ActiveSubscriptionCount: 2, SubscriptionCount: 2}},
+		s.TargetStats(), map[string]TargetStats{
+			"dev1": TargetStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1},
+			"dev2": TargetStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1},
+		})
+
+	c3 := client.BaseClient{}
+	q.Target = "dev1"
+	q.Type = client.Poll
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	go func() {
+		c3.Subscribe(ctx3, q, gnmiclient.Type)
+	}()
+	<-ready3
+	checkSubsCounts(t, "one stream client to dev1 + one stream client to dev2 + one poll client to dev1",
+		s.TypeStats(), map[string]TypeStats{
+			"stream": TypeStats{ActiveSubscriptionCount: 2, SubscriptionCount: 2},
+			"poll":   TypeStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1},
+		},
+		s.TargetStats(), map[string]TargetStats{
+			"dev1": TargetStats{ActiveSubscriptionCount: 2, SubscriptionCount: 2},
+			"dev2": TargetStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1},
+		})
+
+	cancel1()
+	<-wait1
+	checkSubsCounts(t, "one stream client to dev1 cancelled + one stream client to dev2 + one poll client to dev1",
+		s.TypeStats(), map[string]TypeStats{
+			"stream": TypeStats{ActiveSubscriptionCount: 1, SubscriptionCount: 2},
+			"poll":   TypeStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1},
+		},
+		s.TargetStats(), map[string]TargetStats{
+			"dev1": TargetStats{ActiveSubscriptionCount: 1, SubscriptionCount: 2},
+			"dev2": TargetStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1},
+		})
+
+	cancel2()
+	<-wait2
+	checkSubsCounts(t, "one stream client to dev1 cancelled + one stream client to dev2 cancelled + one poll client to dev1",
+		s.TypeStats(), map[string]TypeStats{
+			"stream": TypeStats{ActiveSubscriptionCount: 0, SubscriptionCount: 2},
+			"poll":   TypeStats{ActiveSubscriptionCount: 1, SubscriptionCount: 1},
+		},
+		s.TargetStats(), map[string]TargetStats{
+			"dev1": TargetStats{ActiveSubscriptionCount: 1, SubscriptionCount: 2},
+			"dev2": TargetStats{ActiveSubscriptionCount: 0, SubscriptionCount: 1},
+		})
+
+	cancel3()
+	<-wait3
+	checkSubsCounts(t, "one stream client to dev1 cancelled + one stream client to dev2 cancelled + one poll client to dev1 cancelled",
+		s.TypeStats(), map[string]TypeStats{
+			"stream": TypeStats{ActiveSubscriptionCount: 0, SubscriptionCount: 2},
+			"poll":   TypeStats{ActiveSubscriptionCount: 0, SubscriptionCount: 1},
+		},
+		s.TargetStats(), map[string]TargetStats{
+			"dev1": TargetStats{ActiveSubscriptionCount: 0, SubscriptionCount: 2},
+			"dev2": TargetStats{ActiveSubscriptionCount: 0, SubscriptionCount: 1},
+		})
+}
+
+func checkSubsCounts(t *testing.T, desc string, gotTypSt, wantTypSt map[string]TypeStats, gotTargetSt, wantTargetSt map[string]TargetStats) {
+	checkSubsTypeCounts(t, desc, gotTypSt, wantTypSt)
+	checkSubsTargetCounts(t, desc, gotTargetSt, wantTargetSt)
+}
+
+func checkSubsTypeCounts(t *testing.T, desc string, got, want map[string]TypeStats) {
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Case %q got diff in TypeStats (+got -want): %s", desc, diff)
+	}
+}
+
+func checkSubsTargetCounts(t *testing.T, desc string, got, want map[string]TargetStats) {
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Case %q got diff in TargetStats (+got -want): %s", desc, diff)
+	}
+}
+
+type fakeRPCACL struct {
+	user string
+	acl  ACL
+}
+
+func (r *fakeRPCACL) Check(dev string) bool {
+	return r.acl.Check(r.user, dev)
+}
+
+type fakeACL struct {
+	allow int
+	deny  int
+	check int
+}
+type fakeNet struct{}
+
+func (n *fakeNet) Network() string {
+	return "fake network"
+}
+func (n *fakeNet) String() string {
+	return "127.0.0.1"
+}
+
+type userKey int
+
+var uk userKey
+
+func (a *fakeACL) NewRPCACL(ctx context.Context) (RPCACL, error) {
+	u, ok := ctx.Value(uk).(string)
+	if !ok {
+		return nil, errors.New("no user field in ctx")
+	}
+	r := &fakeRPCACL{user: u, acl: a}
+	return r, nil
+}
+
+func (a *fakeACL) Check(user string, dev string) bool {
+	a.check++
+	m := map[string]map[string]bool{
+		"dev-pii":    {"user1": true, "user2": false},
+		"dev-no-pii": {"user1": true, "user2": true},
+	}
+	if v, ok := m[dev]; ok {
+		if v2, ok := v[user]; ok {
+			if v2 {
+				a.allow++
+			} else {
+				a.deny++
+			}
+			return v2
+		}
+	}
+	a.deny++
+	return false
+}
+
+type fakeSubServer struct {
+	user string
+	ctx  context.Context
+	req  chan *pb.SubscribeRequest
+	rsp  chan *pb.SubscribeResponse
+	grpc.ServerStream
+}
+
+func (s *fakeSubServer) Send(rsp *pb.SubscribeResponse) error {
+	select {
+	case <-s.ctx.Done():
+		return io.ErrClosedPipe
+	default:
+	}
+	s.rsp <- rsp
+	return nil
+}
+
+func (s *fakeSubServer) Recv() (*pb.SubscribeRequest, error) {
+	select {
+	case <-s.ctx.Done():
+		return <-s.req, io.EOF
+	default:
+	}
+	return <-s.req, nil
+}
+
+func (s *fakeSubServer) Context() context.Context {
+	return s.ctx
+}
+
+func TestGNMIACL(t *testing.T) {
+	targets := []string{"dev-pii", "dev-no-pii"}
+	c := cache.New(targets)
+	p, _ := NewServer(c)
+	paths := []client.Path{
+		{"dev-pii", "a", "b"},
+		{"dev-pii", "a", "c"},
+		{"dev-no-pii", "e", "f"},
+		{"dev-no-pii", "a", "b"},
+	}
+	var timestamp time.Time
+	sendUpdates(t, c, paths, &timestamp)
+	tests := []struct {
+		name    string
+		user    string
+		dev     string
+		mode    pb.SubscriptionList_Mode
+		wantErr string
+		wantCnt *fakeACL
+	}{
+		{
+			name:    "user1 once with pii allow",
+			user:    "user1",
+			dev:     "dev-pii",
+			mode:    pb.SubscriptionList_ONCE,
+			wantErr: "<nil>",
+			wantCnt: &fakeACL{allow: 3, deny: 0, check: 3},
+		},
+		{
+			name:    "user2 once with pii deny",
+			user:    "user2",
+			dev:     "dev-pii",
+			mode:    pb.SubscriptionList_ONCE,
+			wantErr: "rpc error: code = PermissionDenied desc = not authorized for target \"dev-pii\"",
+			wantCnt: &fakeACL{allow: 0, deny: 1, check: 1},
+		},
+		{
+			name:    "user1 once all devices with pii allow",
+			user:    "user1",
+			dev:     "*",
+			mode:    pb.SubscriptionList_ONCE,
+			wantErr: "<nil>",
+			wantCnt: &fakeACL{allow: 3, deny: 0, check: 3},
+		},
+		{
+			name:    "user2 once all devices with pii deny",
+			user:    "user2",
+			dev:     "*",
+			mode:    pb.SubscriptionList_ONCE,
+			wantErr: "<nil>",
+			wantCnt: &fakeACL{allow: 1, deny: 2, check: 3},
+		},
+		{
+			name:    "user2 poll with pii deny",
+			user:    "user2",
+			dev:     "dev-pii",
+			mode:    pb.SubscriptionList_POLL,
+			wantErr: "rpc error: code = PermissionDenied desc = not authorized for target \"dev-pii\"",
+			wantCnt: &fakeACL{allow: 0, deny: 1, check: 1},
+		},
+		{
+			name:    "user2 stream with pii deny",
+			user:    "user2",
+			dev:     "dev-pii",
+			mode:    pb.SubscriptionList_STREAM,
+			wantErr: "rpc error: code = PermissionDenied desc = not authorized for target \"dev-pii\"",
+			wantCnt: &fakeACL{allow: 0, deny: 1, check: 1},
+		},
+	}
+
+	for _, test := range tests {
+		facl := &fakeACL{}
+		p.o.acl = facl
+		var cancel context.CancelFunc
+		subSvr := &fakeSubServer{user: test.user,
+			req: make(chan *pb.SubscribeRequest, 2),
+			rsp: make(chan *pb.SubscribeResponse, len(paths)+1)}
+		ctx := peer.NewContext(context.Background(), &peer.Peer{Addr: &fakeNet{}})
+		subSvr.ctx = context.WithValue(ctx, uk, test.user)
+		subSvr.ctx, cancel = context.WithCancel(subSvr.ctx)
+		subSvr.req <- &pb.SubscribeRequest{
+			Request: &pb.SubscribeRequest_Subscribe{
+				Subscribe: &pb.SubscriptionList{
+					Prefix: &pb.Path{
+						Target: test.dev,
+					},
+					Subscription: []*pb.Subscription{
+						&pb.Subscription{
+							Path: &pb.Path{
+								Element: []string{"a"},
+								Elem: []*pb.PathElem{
+									&pb.PathElem{
+										Name: "a",
+									},
+								},
+							},
+						},
+					},
+					Mode: test.mode,
+				},
+			},
+		}
+
+		errCh := make(chan error)
+		go func() {
+			errCh <- p.Subscribe(subSvr)
+		}()
+
+		select {
+		case err := <-errCh:
+			got := fmt.Sprint(err)
+			if diff := cmp.Diff(got, test.wantErr, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("%v returned unexpected result:\n got %v\n want %v\n diff %v", test.name, got, test.wantErr, diff)
+			}
+		case <-time.After(5 * time.Second):
+		}
+		cancel()
+
+		if diff := cmp.Diff(facl, test.wantCnt, cmpopts.EquateEmpty(), cmp.AllowUnexported(fakeACL{})); diff != "" {
+			t.Errorf("%v returned unexpected result:\n got %v\n want %v\n diff %v", test.name, facl, test.wantCnt, diff)
+		}
+	}
+}
+
+func TestIsTargetDelete(t *testing.T) {
+	testCases := []struct {
+		name string
+		noti *pb.Notification
+		want bool
+	}{
+		{
+			name: "GNMI Update",
+			noti: &pb.Notification{
+				Prefix: &pb.Path{Target: "d", Origin: "o"},
+				Update: []*pb.Update{
+					{
+						Path: &pb.Path{
+							Elem: []*pb.PathElem{{Name: "p"}},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "GNMI Leaf Delete",
+			noti: &pb.Notification{
+				Prefix: &pb.Path{Target: "d", Origin: "o"},
+				Delete: []*pb.Path{{
+					Elem: []*pb.PathElem{{Name: "p"}},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "GNMI Root Delete",
+			noti: &pb.Notification{
+				Prefix: &pb.Path{Target: "d", Origin: "o"},
+				Delete: []*pb.Path{{
+					Elem: []*pb.PathElem{{Name: "*"}},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "GNMI Target Delete",
+			noti: &pb.Notification{
+				Prefix: &pb.Path{Target: "d"},
+				Delete: []*pb.Path{{
+					Elem: []*pb.PathElem{{Name: "*"}},
+				}},
+			},
+			want: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := ctree.DetachedLeaf(tc.noti)
+			if got := isTargetDelete(l); got != tc.want {
+				t.Errorf("got %t, want %t", got, tc.want)
+			}
+		})
 	}
 }

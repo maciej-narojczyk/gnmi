@@ -23,8 +23,10 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/openconfig/grpctunnel/tunnel"
+	"google.golang.org/protobuf/proto"
 	"github.com/openconfig/gnmi/path"
+
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 )
 
@@ -112,12 +114,16 @@ type Destination struct {
 	// Extra contains arbitrary additional metadata to be passed to the
 	// target. Optional.
 	Extra map[string]string
+	// TunnelConn follows the net.Conn interface.
+	TunnelConn *tunnel.Conn
 }
 
 // Validate validates the fields of Destination.
 func (d Destination) Validate() error {
-	if len(d.Addrs) == 0 {
-		return errors.New("Destination.Addrs is empty")
+	if d.TunnelConn == nil {
+		if len(d.Addrs) == 0 {
+			return errors.New("Destination.Addrs is empty")
+		}
 	}
 	if d.Credentials != nil {
 		return d.Credentials.validate()
@@ -129,7 +135,8 @@ func (d Destination) Validate() error {
 type Query struct {
 	// Addrs is a slice of addresses by which a target may be reached. Most
 	// clients will only handle the first element.
-	Addrs []string
+	Addrs         []string
+	AddressChains [][]string
 	// Target is the target of the query.  Maybe empty if the query is performed
 	// against an end target vs. a collector.
 	Target string
@@ -171,6 +178,8 @@ type Query struct {
 	// SubReq is an optional field. If not nil, gnmi client implementation uses
 	// it rather than generating from client.Query while sending gnmi Subscribe RPC.
 	SubReq *gpb.SubscribeRequest
+	// TunnelConn follows the net.Conn interface.
+	TunnelConn *tunnel.Conn
 }
 
 // Destination extracts a Destination instance out of Query fields.
@@ -186,6 +195,7 @@ func (q Query) Destination() Destination {
 		Credentials: q.Credentials,
 		TLS:         q.TLS,
 		Extra:       q.Extra,
+		TunnelConn:  q.TunnelConn,
 	}
 }
 
@@ -262,8 +272,8 @@ func (q Query) Validate() error {
 	switch {
 	case q.Type == Unknown:
 		return errors.New("Query type cannot be Unknown")
-	case len(q.Queries) == 0:
-		return errors.New("Query.Queries not set")
+	case len(q.Queries) == 0 && q.SubReq == nil:
+		return errors.New("Neither Query.Queries or Query.SubReq is set")
 	case q.NotificationHandler != nil && q.ProtoHandler != nil:
 		return errors.New("only one of Notification or ProtoHandler must be set")
 	case q.NotificationHandler == nil && q.ProtoHandler == nil:

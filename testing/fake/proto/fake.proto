@@ -1,3 +1,19 @@
+/*
+Copyright 2022 Google Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // fake.proto describes the message format for creating integration tests for
 // streaming telemetry components by generating a reproducible stream of
 // updates from fake targets.
@@ -8,13 +24,15 @@ import "github.com/openconfig/gnmi/proto/gnmi/gnmi.proto";
 
 package gnmi.fake;
 
+option go_package = "github.com/openconfig/gnmi/testing/fake/proto;gnmi_fake";
+
 service AgentManager {
   // Add adds an agent to the server.
   rpc Add(Config) returns (Config);
   // Remove removes an agent from the server.
   rpc Remove(Config) returns (Config);
-  // Get returns the current status of an agent on the server.
-  rpc Get(Config) returns (Config);
+  // Status returns the current status of an agent on the server.
+  rpc Status(Config) returns (Config);
 }
 
 enum State {
@@ -31,7 +49,7 @@ message Configuration {
 }
 
 message Credentials {
-  string username =1;
+  string username = 1;
   string password = 2;
 }
 
@@ -48,15 +66,15 @@ message Config {
   string target = 1;
   // Port for the agent to listen on. If 0 or unset the agent will pick a port
   // for this agent.
-  int64 port = 2;
+  int32 port = 2;
   // A global random seed used in generating subsequent values. Set to have
   // reproducible results.
-  int64 seed = 6 [deprecated=true];
+  int64 seed = 6 [deprecated = true];
   // The list of values generated.  Each value will contain its corresponding
   // target as the first string in the event.GetValue().path meaning that it is
   // possible to generate streams that will be rejected by the cache for testing
   // purposes.
-  repeated Value values = 3 [deprecated=true];
+  repeated Value values = 3 [deprecated = true];
   // Setting disable sync will keep the configured client from autogenerating a
   // sync message. This allows negative testing on sync handling.
   bool disable_sync = 4;
@@ -78,6 +96,10 @@ message Config {
     RandomGenerator random = 101;
     FixedGenerator fixed = 102;
   }
+  // tunnel_addr is the address of the tunnel server.
+  string tunnel_addr = 11;
+  // tunnel_crt is the certificate file for the tunnel conection.
+  string tunnel_crt = 12;
 }
 
 message FixedGenerator {
@@ -90,7 +112,7 @@ message RandomGenerator {
 }
 
 // Delete will cause the value to be deleted at the Value's path.
-message DeleteValue{}
+message DeleteValue {}
 
 // Value is the main message that will trigger a stream of updates for a given
 // path.  A file containing a list of values can be used to simulate a network
@@ -116,6 +138,9 @@ message Value {
     StringValue string_value = 102;
     uint64 sync = 103;
     DeleteValue delete = 104;
+    BoolValue bool_value = 105;
+    UintValue uint_value = 106;
+    StringListValue string_list_value = 107;
   }
 }
 
@@ -215,6 +240,71 @@ message StringValue {
 message StringList {
   // The set of strings which can be used.
   repeated string options = 1;
+  // Set to true to randomize selection of value from options. If false, the
+  // values are cycled in order, starting at index 0.
+  bool random = 2;
+}
+
+message StringListValue {
+  // If distribution is StringList, value is used to hold the value as it
+  // mutates.
+  // If no distribution is set, value is used as it mutates, i.e. constant
+  // update.
+  repeated string value = 1;
+  oneof distribution {
+    StringList list = 2;
+  }
+}
+
+message BoolValue {
+  // If distribution is BoolList, value is only used to hold the value as it
+  // mutates.
+  // If no distribution is set, value is used as it mutates, i.e. constant
+  // update.
+  bool value = 1;
+  oneof distribution {
+    BoolList list = 2;
+  }
+}
+
+message BoolList {
+  // The set of values which can be used.
+  repeated bool options = 1;
+  // Set to true to randomize selection of value from options. If false, the
+  // values are cycled in order, starting at index 0.
+  bool random = 2;
+}
+
+message UintValue {
+  // If distribution is UintRange, value is used as the initial value
+  // inside [minimum, maximum] and hold the value as it mutates.
+  // If distribution is UintList, value is only used to hold the value as it
+  // mutates.
+  // If no distribution is set, value is used as it mutates, i.e. constant
+  // update.
+  uint64 value = 1;
+  oneof distribution {
+    UintRange range = 2;
+    UintList list = 3;
+  }
+}
+
+message UintRange {
+  // The range of the value allowed.
+  uint64 minimum = 1;
+  uint64 maximum = 2;
+  // If set, the value is cumulative and the subsequent value is value + delta
+  // where delta is randomly chosen between delta_min and delta_max.  The range
+  // minimum and maximum are still respected and values will saturate at the
+  // boundaries if they are exceeded. If not set subsequent value is a value
+  // randomly chosen between minimum and maximum.
+  int64 delta_min = 3;
+  int64 delta_max = 4;
+}
+
+message UintList {
+  // The set of values which can be used.
+  repeated uint64 options = 1;
   // Set to true to randomize selection of value from options. If false, the
   // values are cycled in order, starting at index 0.
   bool random = 2;

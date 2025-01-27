@@ -231,51 +231,60 @@ func (t *Tree) GetLeaf(path []string) *Leaf {
 //
 // Note that l.Value can *not* be called inside VisitFunc, because the node is
 // already locked by Query/Walk.
-type VisitFunc func(path []string, l *Leaf, val interface{})
+//
+// If the function returns an error, the Walk or Query will terminate early and
+// return the supplied error.
+type VisitFunc func(path []string, l *Leaf, val interface{}) error
 
-func (t *Tree) enumerateChildren(prefix, path []string, f VisitFunc) {
+func (t *Tree) enumerateChildren(prefix, path []string, f VisitFunc) error {
 	// Caller should hold a read lock on t.
-	if len(path) == 0 {
+	if n := len(path); n == 0 || (n == 1 && path[0] == "*") {
 		switch b := t.leafBranch.(type) {
 		case branch:
 			for k, br := range b {
-				br.queryInternal(append(prefix, k), path, f)
+				if err := br.queryInternal(append(prefix, k), nil, f); err != nil {
+					return err
+				}
 			}
+		case nil: // do nothing
 		default:
-			f(prefix, (*Leaf)(t), t.leafBranch)
+			return f(prefix, (*Leaf)(t), t.leafBranch)
 		}
-		return
+		return nil
 	}
 	if b, ok := t.leafBranch.(branch); ok {
 		for k, br := range b {
-			br.queryInternal(append(prefix, k), path[1:], f)
+			if err := br.queryInternal(append(prefix, k), path[1:], f); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // Query calls f for all leaves that match a given query where zero or more
 // nodes in path may be specified by globs (*). Results and their full paths
 // are passed to f as they are found in the Tree. No ordering of paths is
 // guaranteed.
-func (t *Tree) Query(path []string, f VisitFunc) {
-	t.queryInternal(nil, path, f)
+func (t *Tree) Query(path []string, f VisitFunc) error {
+	return t.queryInternal(nil, path, f)
 }
 
-func (t *Tree) queryInternal(prefix, path []string, f VisitFunc) {
+func (t *Tree) queryInternal(prefix, path []string, f VisitFunc) error {
 	defer t.mu.RUnlock()
 	t.mu.RLock()
 	if len(path) == 0 || path[0] == "*" {
-		t.enumerateChildren(prefix, path, f)
-		return
+		return t.enumerateChildren(prefix, path, f)
 	}
 	if b, ok := t.leafBranch.(branch); ok {
 		if br := b[path[0]]; br != nil {
-			br.queryInternal(append(prefix, path[0]), path[1:], f)
+			return br.queryInternal(append(prefix, path[0]), path[1:], f)
 		}
 	}
+	return nil
 }
 
-func (t *Tree) walkInternal(path []string, f VisitFunc) {
+func (t *Tree) walkInternal(path []string, f VisitFunc) error {
 	defer t.mu.RUnlock()
 	t.mu.RLock()
 	if b, ok := t.leafBranch.(branch); ok {
@@ -283,24 +292,26 @@ func (t *Tree) walkInternal(path []string, f VisitFunc) {
 		for name, br := range b {
 			p := make([]string, l, l+1)
 			copy(p, path)
-			br.walkInternal(append(p, name), f)
+			if err := br.walkInternal(append(p, name), f); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 	// If this is the root node and it has no children and the value is nil,
 	// most likely it's just the zero value of Tree not a valid leaf.
 	if len(path) == 0 && t.leafBranch == nil {
-		return
+		return nil
 	}
-	f(path, (*Leaf)(t), t.leafBranch)
+	return f(path, (*Leaf)(t), t.leafBranch)
 }
 
 // Walk calls f for all leaves.
-func (t *Tree) Walk(f VisitFunc) {
-	t.walkInternal(nil, f)
+func (t *Tree) Walk(f VisitFunc) error {
+	return t.walkInternal(nil, f)
 }
 
-func (t *Tree) walkInternalSorted(path []string, f VisitFunc) {
+func (t *Tree) walkInternalSorted(path []string, f VisitFunc) error {
 	defer t.mu.RUnlock()
 	t.mu.RLock()
 	if b, ok := t.leafBranch.(branch); ok {
@@ -313,39 +324,62 @@ func (t *Tree) walkInternalSorted(path []string, f VisitFunc) {
 		for _, name := range names {
 			p := make([]string, l, l+1)
 			copy(p, path)
-			b[name].walkInternalSorted(append(p, name), f)
+			if err := b[name].walkInternalSorted(append(p, name), f); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 	// If this is the root node and it has no children and the value is nil,
 	// most likely it's just the zero value of Tree not a valid leaf.
 	if len(path) == 0 && t.leafBranch == nil {
-		return
+		return nil
 	}
-	f(path, (*Leaf)(t), t.leafBranch)
+	return f(path, (*Leaf)(t), t.leafBranch)
 }
 
 // WalkSorted calls f for all leaves in string sorted order.
-func (t *Tree) WalkSorted(f VisitFunc) {
-	t.walkInternalSorted(nil, f)
+func (t *Tree) WalkSorted(f VisitFunc) error {
+	return t.walkInternalSorted(nil, f)
 }
 
-// internalDelete removes nodes recursively that match subpath.  It returns true
-// if the current node is to be removed from the parent and a slice of subpaths
-// ([]string) for all leaves deleted thus far.
-func (t *Tree) internalDelete(subpath []string, condition func(interface{}) bool) (bool, [][]string) {
-	if len(subpath) == 0 {
+// WalkDeleted removes nodes recursively that match path and satisfy the
+// condition function and calls function f on every removed node.
+func (t *Tree) WalkDeleted(path []string, condition func(interface{}) bool, f func(interface{})) {
+	// It is possible that a single delete operation will remove the whole Tree,
+	// so only the top level write lock is obtained to prevent concurrent accesses
+	// to the entire Tree.
+	defer t.mu.Unlock()
+	t.mu.Lock()
+	if delBr, _ := t.internalDelete(path, condition, f, false); delBr {
+		t.leafBranch = nil
+	}
+}
+
+// internalDelete removes nodes recursively that match subpath and satisfy
+// function condition. It also calls function f on every removed leaf. It
+// returns true if the current node is to be removed from the parent and
+// a slice of subpaths ([]string) for all leaves deleted thus far if
+// retDeletedPaths is true. If retDeletedPaths is false, the returned slice
+// of subpaths is nil.
+func (t *Tree) internalDelete(subpath []string, condition func(interface{}) bool, f func(interface{}), retDeletedPaths bool) (bool, [][]string) {
+	if len(subpath) == 0 || subpath[0] == "*" {
+		if len(subpath) != 0 {
+			subpath = subpath[1:]
+		}
 		// The subpath is a full path to a leaf.
 		switch b := t.leafBranch.(type) {
 		case branch:
 			// The subpath terminates in a branch node and will recursively delete any
 			// progeny leaves.
-			allLeaves := [][]string{}
+			var allLeaves [][]string
 			for k, v := range b {
-				del, leaves := v.internalDelete(subpath, condition)
-				leaf := []string{k}
-				for _, l := range leaves {
-					allLeaves = append(allLeaves, append(leaf, l...))
+				del, leaves := v.internalDelete(subpath, condition, f, retDeletedPaths)
+				if retDeletedPaths {
+					leaf := []string{k}
+					for _, l := range leaves {
+						allLeaves = append(allLeaves, append(leaf, l...))
+					}
 				}
 				if del {
 					delete(b, k)
@@ -356,19 +390,25 @@ func (t *Tree) internalDelete(subpath []string, condition func(interface{}) bool
 			if condition(t.leafBranch) {
 				// The second parameter is an empty path that will be filled as recursion
 				// unwinds for this leaf that will be deleted in its parent.
-				return true, [][]string{[]string{}}
+				f(t.leafBranch)
+				if retDeletedPaths {
+					return true, [][]string{[]string{}}
+				}
+				return true, nil
 			}
-			return false, [][]string{}
+			return false, nil
 		}
 	}
 	if b, ok := t.leafBranch.(branch); ok {
 		// Continue to recurse on subpath while it matches nodes in the Tree.
 		if br := b[subpath[0]]; br != nil {
-			delBr, allLeaves := br.internalDelete(subpath[1:], condition)
-			leaf := []string{subpath[0]}
-			// Prepend branch node name to all progeny leaves of branch.
-			for i := range allLeaves {
-				allLeaves[i] = append(leaf, allLeaves[i]...)
+			delBr, allLeaves := br.internalDelete(subpath[1:], condition, f, retDeletedPaths)
+			if retDeletedPaths {
+				leaf := []string{subpath[0]}
+				// Prepend branch node name to all progeny leaves of branch.
+				for i := range allLeaves {
+					allLeaves[i] = append(leaf, allLeaves[i]...)
+				}
 			}
 			// Remove branch if requested.
 			if delBr {
@@ -383,7 +423,7 @@ func (t *Tree) internalDelete(subpath []string, condition func(interface{}) bool
 		}
 	}
 	// The subpath doesn't match any Tree branch, return empty list of leaves.
-	return false, [][]string{}
+	return false, nil
 }
 
 // DeleteConditional removes all leaves at or below subpath as well as any
@@ -396,7 +436,7 @@ func (t *Tree) DeleteConditional(subpath []string, condition func(interface{}) b
 	// to the entire Tree.
 	defer t.mu.Unlock()
 	t.mu.Lock()
-	delBr, leaves := t.internalDelete(subpath, condition)
+	delBr, leaves := t.internalDelete(subpath, condition, func(interface{}) {}, true)
 	if delBr {
 		t.leafBranch = nil
 	}

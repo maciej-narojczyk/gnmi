@@ -17,14 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"context"
 )
-
-var testRoot = "."
 
 func TestErrorsRunCollector(t *testing.T) {
 	tests := []struct {
@@ -83,19 +80,26 @@ func TestErrorsRunCollector(t *testing.T) {
 		config: "good.cfg",
 		cert:   "good.crt",
 		desc:   "missing key",
+	}, {
+		desc:   "tunnel test",
+		config: "good_tunnel.cfg",
+		cert:   "good.crt",
+		key:    "good.key",
+		valid:  true,
 	}}
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
+			*port = 0
 			if test.config != "" {
-				*configFile = filepath.Join(testRoot, "testdata", test.config)
+				*configFile = filepath.Join("testdata", test.config)
 				defer func() { *configFile = "" }()
 			}
 			if test.cert != "" {
-				*certFile = filepath.Join(testRoot, "testdata", test.cert)
+				*certFile = filepath.Join("testdata", test.cert)
 				defer func() { *certFile = "" }()
 			}
 			if test.key != "" {
-				*keyFile = filepath.Join(testRoot, "testdata", test.key)
+				*keyFile = filepath.Join("testdata", test.key)
 				defer func() { *keyFile = "" }()
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)

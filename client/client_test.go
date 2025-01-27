@@ -17,14 +17,14 @@ limitations under the License.
 package client_test
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sort"
 	"testing"
 	"time"
 
-	"context"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"github.com/openconfig/gnmi/client"
 	fclient "github.com/openconfig/gnmi/client/fake"
 )

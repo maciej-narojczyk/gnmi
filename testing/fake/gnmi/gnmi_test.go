@@ -17,6 +17,7 @@ limitations under the License.
 package gnmi
 
 import (
+	"golang.org/x/net/context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -25,7 +26,6 @@ import (
 	"sync"
 	"testing"
 
-	"golang.org/x/net/context"
 	"github.com/kylelemons/godebug/pretty"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -425,7 +425,6 @@ func TestNewAgent(t *testing.T) {
 				}
 				return
 			}
-			go a.Serve()
 			conn, err := grpc.Dial(a.Address(), grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
 				InsecureSkipVerify: true,
 			})))

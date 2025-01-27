@@ -21,6 +21,7 @@ limitations under the License.
 package gnmi
 
 import (
+	"golang.org/x/net/context"
 	"errors"
 	"fmt"
 	"net"
@@ -28,11 +29,11 @@ import (
 	"sync"
 
 	log "github.com/golang/glog"
-	"golang.org/x/net/context"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+	"github.com/openconfig/grpctunnel/tunnel"
 
+	tunnelpb "github.com/openconfig/grpctunnel/proto/tunnel"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	fpb "github.com/openconfig/gnmi/testing/fake/proto"
 )
@@ -41,15 +42,16 @@ import (
 // via Subscribe or Get will receive a stream of updates based on the requested
 // path and the provided initial configuration.
 type Agent struct {
+	gnmipb.UnimplementedGNMIServer
 	mu     sync.Mutex
 	s      *grpc.Server
-	lis    net.Listener
+	lis    []net.Listener
 	target string
 	state  fpb.State
 	config *fpb.Config
-	// cMu protects clients.
-	cMu     sync.Mutex
-	clients map[string]*Client
+	// cMu protects client.
+	cMu    sync.Mutex
+	client *Client
 }
 
 // New returns an initialized fake agent.
@@ -66,35 +68,64 @@ func New(config *fpb.Config, opts []grpc.ServerOption) (*Agent, error) {
 // NewFromServer returns a new initialized fake agent from provided server.
 func NewFromServer(s *grpc.Server, config *fpb.Config) (*Agent, error) {
 	a := &Agent{
-		s:       s,
-		state:   fpb.State_INIT,
-		config:  config,
-		clients: map[string]*Client{},
-		target:  config.Target,
+		s:      s,
+		state:  fpb.State_INIT,
+		config: config,
+		target: config.Target,
 	}
 	var err error
 	if a.config.Port < 0 {
 		a.config.Port = 0
 	}
-	a.lis, err = net.Listen("tcp", fmt.Sprintf(":%d", a.config.Port))
+
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", a.config.Port))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open listener port %d: %v", a.config.Port, err)
 	}
+	a.lis = append(a.lis, lis)
+
+	if config.TunnelAddr != "" {
+		targets := map[tunnel.Target]struct{}{tunnel.Target{ID: config.Target, Type: tunnelpb.TargetType_GNMI_GNOI.String()}: struct{}{}}
+		lis, err = tunnel.Listen(context.Background(), config.TunnelAddr, config.TunnelCrt, targets)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open listener port %d: %v", a.config.Port, err)
+		}
+		a.lis = append(a.lis, lis)
+	}
+
 	gnmipb.RegisterGNMIServer(a.s, a)
 	log.V(1).Infof("Created Agent: %s on %s", a.target, a.Address())
+	go a.serve()
 	return a, nil
 }
 
-// Serve will start the agent serving and block until closed.
-func (a *Agent) Serve() error {
+// serve will start the agent serving and block until closed.
+func (a *Agent) serve() error {
 	a.mu.Lock()
 	a.state = fpb.State_RUNNING
 	s := a.s
+	lis := a.lis
 	a.mu.Unlock()
-	if s == nil {
+	if s == nil || lis == nil {
 		return fmt.Errorf("Serve() failed: not initialized")
 	}
-	return a.s.Serve(a.lis)
+
+	chErr := make(chan error, len(lis))
+	for _, l := range lis {
+		go func(l net.Listener) {
+			log.Infof("listening: %s", l.Addr())
+			chErr <- s.Serve(l)
+		}(l)
+	}
+
+	for range lis {
+		if err := <-chErr; err != nil {
+			log.Infof("received error serving: %v", err)
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Target returns the target name the agent is faking.
@@ -109,13 +140,16 @@ func (a *Agent) Type() string {
 
 // Address returns the port the agent is listening to.
 func (a *Agent) Address() string {
-	addr := a.lis.Addr().String()
-	return strings.Replace(addr, "[::]", "localhost", 1)
-}
-
-// Port returns the port the agent is listening to.
-func (a *Agent) Port() int64 {
-	return a.config.Port
+	var addr string
+	for _, l := range a.lis {
+		// Skip tunnel listeners.
+		// We assume there is at most one non-tunnel listener.
+		if _, ok := l.(*tunnel.Listener); !ok {
+			addr = strings.Replace(l.Addr().String(), "[::]", "localhost", 1)
+			break
+		}
+	}
+	return addr
 }
 
 // State returns the current state of the agent.
@@ -125,66 +159,37 @@ func (a *Agent) State() fpb.State {
 	return a.state
 }
 
-// Close shuts down the agent and closes all clients currently connected to the
-// agent.
+// Close shuts down the agent.
 func (a *Agent) Close() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.Clear()
 	a.state = fpb.State_STOPPED
 	if a.s == nil {
 		return
 	}
 	a.s.Stop()
+	for _, l := range a.lis {
+		l.Close()
+	}
 	a.s = nil
 	a.lis = nil
-}
-
-// Clear closes all currently connected clients of the agent.
-func (a *Agent) Clear() {
-	a.cMu.Lock()
-	defer a.cMu.Unlock()
-	var wg sync.WaitGroup
-	for k, v := range a.clients {
-		log.V(1).Infof("Closing client: %s", k)
-		wg.Add(1)
-		go func(name string, c *Client) {
-			c.Close()
-			log.V(1).Infof("Client %s closed", name)
-			wg.Done()
-		}(k, v)
-	}
-	wg.Wait()
-	a.clients = map[string]*Client{}
 }
 
 // Subscribe implements the gNMI Subscribe RPC.
 func (a *Agent) Subscribe(stream gnmipb.GNMI_SubscribeServer) error {
 	c := NewClient(a.config)
+	defer c.Close()
 
 	a.cMu.Lock()
-	a.clients[c.String()] = c
+	a.client = c
 	a.cMu.Unlock()
 
-	err := c.Run(stream)
+	return c.Run(stream)
+}
+
+// Requests returns the subscribe requests received by the most recently created client.
+func (a *Agent) Requests() []*gnmipb.SubscribeRequest {
 	a.cMu.Lock()
-	delete(a.clients, c.String())
-	a.cMu.Unlock()
-
-	return err
-}
-
-// Get implements the gNMI Get RPC.
-func (a *Agent) Get(context.Context, *gnmipb.GetRequest) (*gnmipb.GetResponse, error) {
-	return nil, grpc.Errorf(codes.Unimplemented, "Get() is not implemented for gRPC/gNMI fakes")
-}
-
-// Set implements the gNMI Set RPC.
-func (a *Agent) Set(context.Context, *gnmipb.SetRequest) (*gnmipb.SetResponse, error) {
-	return nil, grpc.Errorf(codes.Unimplemented, "Set() is not implemented for gRPC/gNMI fakes")
-}
-
-// Capabilities implements the gNMI Capabilities RPC.
-func (a *Agent) Capabilities(context.Context, *gnmipb.CapabilityRequest) (*gnmipb.CapabilityResponse, error) {
-	return nil, grpc.Errorf(codes.Unimplemented, "Capabilities() is not implemented for gRPC/gNMI fakes")
+	defer a.cMu.Unlock()
+	return a.client.requests
 }

@@ -17,13 +17,15 @@ limitations under the License.
 // The gnmi_cli program implements the GNMI CLI.
 //
 // usage:
-// gnmi_cli --address=<ADDRESS>                            \
-//            -q=<OPENCONFIG_PATH[,OPENCONFIG_PATH[,...]]> \
-//            [-qt=<QUERY_TYPE>]                           \
-//            [-<ADDITIONAL_OPTION(s)>]
+//
+//	gnmi_cli --address=<ADDRESS>                            \
+//	           -q=<OPENCONFIG_PATH[,OPENCONFIG_PATH[,...]]> \
+//	           [-qt=<QUERY_TYPE>]                           \
+//	          [-<ADDITIONAL_OPTION(s)>]
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -40,6 +42,8 @@ import (
 	"flag"
 
 	log "github.com/golang/glog"
+	"golang.org/x/crypto/ssh/terminal"
+	"google.golang.org/protobuf/encoding/prototext"
 	"github.com/golang/protobuf/proto"
 	"github.com/jipanyang/gnmi/cli"
 	"github.com/openconfig/gnmi/client"
@@ -65,18 +69,21 @@ var (
 	queryType   = flag.String("query_type", client.Once.String(), "Type of result, one of: (o, once, p, polling, s, streaming).")
 	queryAddr   = flags.NewStringList(&q.Addrs, nil)
 
-	reqProto = flag.String("proto", "", "Text proto for gNMI request.")
+	reqProto  = flag.String("proto", "", "Text proto for gNMI request.")
+	protoFile = flag.String("proto_file", "", "Text proto file for gNMI request.")
 
 	capabilitiesFlag = flag.Bool("capabilities", false, `When set, CLI will perform a Capabilities request. Usage: gnmi_cli -capabilities [-proto <gnmi.CapabilityRequest>] -address <address> [other flags ...]`)
 	getFlag          = flag.Bool("get", false, `When set, CLI will perform a Get request. Usage: gnmi_cli -get -proto <gnmi.GetRequest> -address <address> [other flags ...]`)
 	setFlag          = flag.Bool("set", false, `When set, CLI will perform a Set request. Usage: gnmi_cli -set -proto <gnmi.SetRequest> -address <address> [other flags ...]`)
-
-	withUserPass = flag.Bool("with_user_pass", false, "When set, CLI will prompt for username/password to use when connecting to a target.")
+	setReqFlag       = flag.Bool("include_set_req", false, `When set, CLI will pretty print the inputted set request`)
+	withUserPass     = flag.Bool("with_user_pass", false, "When set, CLI will prompt for username/password to use when connecting to a target.")
+	withPerRPCAuth   = flag.Bool("with_per_rpc_auth", false, "Use per RPC auth.")
 
 	// Certificate files.
-	caCert     = flag.String("ca_crt", "", "CA certificate file. Used to verify server TLS certificate.")
-	clientCert = flag.String("client_crt", "", "Client certificate file. Used for client certificate-based authentication.")
-	clientKey  = flag.String("client_key", "", "Client private key file. Used for client certificate-based authentication.")
+	insecureFlag = flag.Bool("insecure", false, "use insecure GRPC connection.")
+	caCert       = flag.String("ca_crt", "", "CA certificate file. Used to verify server TLS certificate.")
+	clientCert   = flag.String("client_crt", "", "Client certificate file. Used for client certificate-based authentication.")
+	clientKey    = flag.String("client_key", "", "Client private key file. Used for client certificate-based authentication.")
 )
 
 func init() {
@@ -102,7 +109,7 @@ func init() {
 	flag.UintVar(&cfg.ConcurrentMax, "concurrent_max", 1, "Double number of concurrent client connections until ConcurrentMax reached.")
 
 	flag.StringVar(&q.TLS.ServerName, "server_name", "", "When set, CLI will use this hostname to verify server certificate during TLS handshake.")
-	flag.BoolVar(&q.TLS.InsecureSkipVerify, "insecure", false, "When set, CLI will not verify the server certificate during TLS handshake.")
+	flag.BoolVar(&q.TLS.InsecureSkipVerify, "tls_skip_verify", false, "When set, CLI will not verify the server certificate during TLS handshake.")
 
 	// Shortcut flags that can be used in place of the longform flags above.
 	flag.Var(queryAddr, "a", "Short for address.")
@@ -169,6 +176,10 @@ func main() {
 		q.TLS.Certificates = []tls.Certificate{certificate}
 	}
 
+	if *insecureFlag {
+		q.TLS = nil
+	}
+
 	var err error
 	switch {
 	case *capabilitiesFlag: // gnmi.Capabilities
@@ -181,14 +192,19 @@ func main() {
 		err = executeSubscribe(ctx)
 	}
 	if err != nil {
-		log.Error(err)
+		cfg.Display([]byte(fmt.Sprintf("%v", err)))
+		os.Exit(1)
 	}
 }
 
 func executeCapabilities(ctx context.Context) error {
+	s, err := protoRequestFromFlags()
+	if err != nil {
+		return err
+	}
 	r := &gpb.CapabilityRequest{}
-	if err := proto.UnmarshalText(*reqProto, r); err != nil {
-		return fmt.Errorf("unable to parse gnmi.CapabilityRequest from %q : %v", *reqProto, err)
+	if err := prototext.Unmarshal([]byte(s), r); err != nil {
+		return fmt.Errorf("unable to parse gnmi.CapabilityRequest from %q : %v", s, err)
 	}
 	c, err := gclient.New(ctx, client.Destination{
 		Addrs:       q.Addrs,
@@ -204,17 +220,21 @@ func executeCapabilities(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("target returned RPC error for Capabilities(%q): %v", r.String(), err)
 	}
-	cfg.Display([]byte(proto.MarshalTextString(response)))
+	cfg.Display([]byte(prototext.Format(response)))
 	return nil
 }
 
 func executeGet(ctx context.Context) error {
-	if *reqProto == "" {
-		return errors.New("-proto must be set")
+	s, err := protoRequestFromFlags()
+	if err != nil {
+		return err
+	}
+	if s == "" {
+		return errors.New("-proto must be set or -proto_file must contain proto")
 	}
 	r := &gpb.GetRequest{}
-	if err := proto.UnmarshalText(*reqProto, r); err != nil {
-		return fmt.Errorf("unable to parse gnmi.GetRequest from %q : %v", *reqProto, err)
+	if err := prototext.Unmarshal([]byte(s), r); err != nil {
+		return fmt.Errorf("unable to parse gnmi.GetRequest from %q : %v", s, err)
 	}
 	c, err := gclient.New(ctx, client.Destination{
 		Addrs:       q.Addrs,
@@ -230,17 +250,24 @@ func executeGet(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("target returned RPC error for Get(%q): %v", r.String(), err)
 	}
-	cfg.Display([]byte(proto.MarshalTextString(response)))
+	cfg.Display([]byte(prototext.Format(response)))
 	return nil
 }
 
 func executeSet(ctx context.Context) error {
-	if *reqProto == "" {
-		return errors.New("-proto must be set")
+	s, err := protoRequestFromFlags()
+	if err != nil {
+		return err
+	}
+	if s == "" {
+		return errors.New("-proto must be set or -proto_file must contain proto")
 	}
 	r := &gpb.SetRequest{}
-	if err := proto.UnmarshalText(*reqProto, r); err != nil {
-		return fmt.Errorf("unable to parse gnmi.SetRequest from %q : %v", *reqProto, err)
+	if err := prototext.Unmarshal([]byte(s), r); err != nil {
+		return fmt.Errorf("unable to parse gnmi.SetRequest from %q : %v", s, err)
+	}
+	if *setReqFlag {
+		cfg.Display([]byte(prototext.Format(r)))
 	}
 	c, err := gclient.New(ctx, client.Destination{
 		Addrs:       q.Addrs,
@@ -254,14 +281,18 @@ func executeSet(ctx context.Context) error {
 	}
 	response, err := c.(*gclient.Client).Set(ctx, r)
 	if err != nil {
-		return fmt.Errorf("target returned RPC error for Set(%q) : %v", r, err)
+		return fmt.Errorf("failed to apply Set: %w", err)
 	}
-	cfg.Display([]byte(proto.MarshalTextString(response)))
+	cfg.Display([]byte(prototext.Format(response)))
 	return nil
 }
 
 func executeSubscribe(ctx context.Context) error {
-	if *reqProto != "" {
+	s, err := protoRequestFromFlags()
+	if err != nil {
+		return err
+	}
+	if s != "" {
 		// Convert SubscribeRequest to a client.Query
 		tq, err := cli.ParseSubscribeProto(*reqProto)
 		if err != nil {
@@ -294,7 +325,13 @@ func executeSubscribe(ctx context.Context) error {
 
 func readCredentials() (*client.Credentials, error) {
 	c := &client.Credentials{}
-
+	user := os.Getenv("GNMI_USER")
+	pass := os.Getenv("GNMI_PASS")
+	if user != "" && pass != "" {
+		c.Username = user
+		c.Password = pass
+		return c, nil
+	}
 	fmt.Print("username: ")
 	_, err := fmt.Scan(&c.Username)
 	if err != nil {
@@ -302,11 +339,12 @@ func readCredentials() (*client.Credentials, error) {
 	}
 
 	fmt.Print("password: ")
-	pass, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	pb, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Print("\n") // Echo 'Enter' key.
 	if err != nil {
 		return nil, err
 	}
-	c.Password = string(pass)
+	c.Password = string(pb)
 
 	return c, nil
 }
@@ -346,4 +384,18 @@ func parseQuery(query, delim string) ([]string, error) {
 		return nil, fmt.Errorf("malformed query, missing trailing ']': %q", query)
 	}
 	return strings.Split(string(buf), string(null)), nil
+}
+
+func protoRequestFromFlags() (string, error) {
+	if *protoFile != "" {
+		if *reqProto != "" {
+			return "", errors.New("only one of -proto and -proto_file are allowed to be set")
+		}
+		b, err := os.ReadFile(*protoFile)
+		if err != nil {
+			return "", fmt.Errorf("could not read %q: %v", *protoFile, err)
+		}
+		return string(b), nil
+	}
+	return *reqProto, nil
 }

@@ -21,10 +21,9 @@ limitations under the License.
 package coalesce
 
 import (
+	"context"
 	"errors"
 	"sync"
-
-	"context"
 )
 
 // Queue is a structure that implements in-order delivery of coalesced inputs.
@@ -127,10 +126,16 @@ func (q *Queue) next() (interface{}, uint32, bool) {
 	if len(q.queue) == 0 {
 		return nil, 0, false
 	}
-	var i interface{}
-	i, q.queue = q.queue[0], q.queue[1:]
+	i := q.queue[0]
+	// Remove reference from underlying array to allow garbage collection.
+	q.queue[0] = nil
+	q.queue = q.queue[1:]
 	coalesced := q.coalesced[i]
 	delete(q.coalesced, i)
+	if len(q.queue) == 0 {
+		q.queue = nil
+		q.coalesced = make(map[interface{}]uint32)
+	}
 	return i, coalesced, true
 }
 

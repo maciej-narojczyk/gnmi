@@ -18,83 +18,204 @@ limitations under the License.
 package subscribe
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	log "github.com/golang/glog"
-	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"github.com/openconfig/gnmi/cache"
-	"github.com/openconfig/gnmi/client"
 	"github.com/openconfig/gnmi/coalesce"
 	"github.com/openconfig/gnmi/ctree"
 	"github.com/openconfig/gnmi/match"
 	"github.com/openconfig/gnmi/path"
-	"github.com/openconfig/gnmi/unimplemented"
-	"github.com/openconfig/gnmi/value"
 
 	pb "github.com/openconfig/gnmi/proto/gnmi"
 )
 
-var (
-	// Value overridden in tests to simulate flow control.
-	flowControlTest = func() {}
-	// Timeout specifies how long a send can be pending before the RPC is closed.
-	Timeout = time.Minute
-	// SubscriptionLimit specifies how many queries can be processing simultaneously.
-	// This number includes Once queries, Polling subscriptions, and Streaming
-	// subscriptions that have not yet synced. Once a streaming subscription has
-	// synced, it no longer counts against the limit. A polling subscription
-	// counts against the limit during each polling cycle while it is processed.
-	SubscriptionLimit = 0
-	// Value overridden in tests to evaluate SubscriptionLimit enforcement.
-	subscriptionLimitTest = func() {}
-)
+type aclStub struct{}
+
+func (a *aclStub) Check(string) bool {
+	return true
+}
+
+// RPCACL is the per RPC ACL interface
+type RPCACL interface {
+	Check(string) bool
+}
+
+// ACL is server ACL interface
+type ACL interface {
+	NewRPCACL(context.Context) (RPCACL, error)
+	Check(string, string) bool
+}
+
+// options contains options for creating a Server.
+type options struct {
+	noDupReport bool
+	timeout     time.Duration
+	stats       *stats
+	acl         ACL
+	// Test override functions
+	flowControlTest          func()
+	clientStatsTest          func(int64, int64)
+	updateSubsCountEnterTest func()
+	updateSubsCountExitTest  func()
+}
+
+// Option defines the function prototype to set options for creating a Server.
+type Option func(*options)
+
+// WithTimeout returns an Option to specify how long a send can be pending
+// before the RPC is closed.
+func WithTimeout(t time.Duration) Option {
+	return func(o *options) {
+		o.timeout = t
+	}
+}
+
+// WithFlowControlTest returns an Option to override a test function to
+// simulate flow control.
+func WithFlowControlTest(f func()) Option {
+	return func(o *options) {
+		o.flowControlTest = f
+	}
+}
+
+// WithClientStatsTest test override function.
+func WithClientStatsTest(f func(int64, int64)) Option {
+	return func(o *options) {
+		o.clientStatsTest = f
+	}
+}
+
+// WithUpdateSubsCountEnterTest test override function.
+func WithUpdateSubsCountEnterTest(f func()) Option {
+	return func(o *options) {
+		o.updateSubsCountEnterTest = f
+	}
+}
+
+// WithUpdateSubsCountExitTest test override function.
+func WithUpdateSubsCountExitTest(f func()) Option {
+	return func(o *options) {
+		o.updateSubsCountExitTest = f
+	}
+}
+
+// WithStats returns an Option to enable statistics collection of client
+// queries to the server.
+func WithStats() Option {
+	return func(o *options) {
+		o.stats = newStats()
+	}
+}
+
+// WithACL sets server ACL.
+func WithACL(a ACL) Option {
+	return func(o *options) {
+		o.acl = a
+	}
+}
+
+// WithoutDupReport returns an Option to disable reporting of duplicates in
+// the responses to the clients. When duplicate reporting is disabled, there
+// is no need to clone the Notification proto message for setting a non-zero
+// field "duplicates" in a response sent to clients, which can potentially
+// save CPU cycles.
+func WithoutDupReport() Option {
+	return func(o *options) {
+		o.noDupReport = true
+	}
+}
 
 // Server is the implementation of the gNMI Subcribe API.
 type Server struct {
-	unimplemented.Server // Stub out all RPCs except Subscribe.
+	pb.UnimplementedGNMIServer // Stub out all RPCs except Subscribe.
 
 	c *cache.Cache // The cache queries are performed against.
 	m *match.Match // Structure to match updates against active subscriptions.
-	// subscribeSlots is a channel of size SubscriptionLimit to restrict how many
-	// queries are in flight.
-	subscribeSlots chan struct{}
-	timeout        time.Duration
+	o options
 }
 
 // NewServer instantiates server to handle client queries.  The cache should be
 // already instantiated.
-func NewServer(c *cache.Cache) (*Server, error) {
-	s := &Server{c: c, m: match.New(), timeout: Timeout}
-	if SubscriptionLimit > 0 {
-		s.subscribeSlots = make(chan struct{}, SubscriptionLimit)
+func NewServer(c *cache.Cache, opts ...Option) (*Server, error) {
+	o := options{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
 	}
-	return s, nil
+	if o.timeout == 0 {
+		o.timeout = time.Minute
+	}
+	return &Server{c: c, m: match.New(), o: o}, nil
+}
+
+// UpdateNotification uses paths in a pb.Notification n to match registered
+// clients in m and pass value v to those clients.
+// prefix is the prefix of n that should be used to match clients in m.
+// Depending on the caller, the target may or may not be in prefix.
+// v should be n itself or the container of n (e.g. a ctree.Leaf) depending
+// on the caller.
+func UpdateNotification(m *match.Match, v interface{}, n *pb.Notification, prefix []string) {
+	var updated map[match.Client]struct{}
+	if len(n.Update)+len(n.Delete) > 1 {
+		updated = make(map[match.Client]struct{})
+	}
+	for _, u := range n.Update {
+		m.UpdateOnce(v, append(prefix, path.ToStrings(u.Path, false)...), updated)
+	}
+	for _, d := range n.Delete {
+		m.UpdateOnce(v, append(prefix, path.ToStrings(d, false)...), updated)
+	}
 }
 
 // Update passes a streaming update to registered clients.
 func (s *Server) Update(n *ctree.Leaf) {
 	switch v := n.Value().(type) {
-	case client.Delete:
-		s.m.Update(n, v.Path)
-	case client.Update:
-		s.m.Update(n, v.Path)
 	case *pb.Notification:
-		p := path.ToStrings(v.Prefix, true)
-		if len(v.Update) > 0 {
-			p = append(p, path.ToStrings(v.Update[0].Path, false)...)
-		} else if len(v.Delete) > 0 {
-			p = append(p, path.ToStrings(v.Delete[0], false)...)
-		}
-		// If neither update nor delete notification exists,
-		// just go with the path in the prefix
-		s.m.Update(n, p)
+		UpdateNotification(s.m, n, v, path.ToStrings(v.Prefix, true))
 	default:
 		log.Errorf("update is not a known type; type is %T", v)
+	}
+}
+
+func (s *Server) updateTargetCounts(target string) func() {
+	if s.o.stats == nil {
+		return func() {}
+	}
+	st := s.o.stats.targetStats(target)
+	atomic.AddInt64(&st.ActiveSubscriptionCount, 1)
+	atomic.AddInt64(&st.SubscriptionCount, 1)
+	return func() {
+		atomic.AddInt64(&st.ActiveSubscriptionCount, -1)
+		if s.o.updateSubsCountExitTest != nil {
+			s.o.updateSubsCountExitTest()
+		}
+	}
+}
+
+func (s *Server) updateTypeCounts(typ string) func() {
+	if s.o.stats == nil {
+		return func() {}
+	}
+	st := s.o.stats.typeStats(typ)
+	atomic.AddInt64(&st.ActiveSubscriptionCount, 1)
+	atomic.AddInt64(&st.SubscriptionCount, 1)
+	if s.o.updateSubsCountEnterTest != nil {
+		s.o.updateSubsCountEnterTest()
+	}
+	return func() {
+		atomic.AddInt64(&st.ActiveSubscriptionCount, -1)
 	}
 }
 
@@ -102,13 +223,17 @@ func (s *Server) Update(n *ctree.Leaf) {
 func addSubscription(m *match.Match, s *pb.SubscriptionList, c *matchClient) (remove func()) {
 	var removes []func()
 	prefix := path.ToStrings(s.Prefix, true)
-	for _, p := range s.Subscription {
-		if p.Path == nil {
+	for _, sub := range s.Subscription {
+		p := sub.GetPath()
+		if p == nil {
 			continue
 		}
-		// TODO(yusufsn) : Origin field in the Path may need to be included
-		path := append(prefix, path.ToStrings(p.Path, false)...)
-		removes = append(removes, m.AddQuery(path, c))
+		query := prefix
+		if origin := p.GetOrigin(); s.Prefix.GetOrigin() == "" && origin != "" {
+			query = append(prefix, origin)
+		}
+		query = append(query, path.ToStrings(p, false)...)
+		removes = append(removes, m.AddQuery(query, c))
 	}
 	return func() {
 		for _, remove := range removes {
@@ -120,8 +245,16 @@ func addSubscription(m *match.Match, s *pb.SubscriptionList, c *matchClient) (re
 // Subscribe is the entry point for the external RPC request of the same name
 // defined in gnmi.proto.
 func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
-	c := streamClient{stream: stream}
+	c := streamClient{stream: stream, acl: &aclStub{}}
 	var err error
+	if s.o.acl != nil {
+		a, err := s.o.acl.NewRPCACL(stream.Context())
+		if err != nil {
+			log.Errorf("NewRPCACL fails due to %v", err)
+			return status.Error(codes.Unauthenticated, "no authentication/authorization for requested operation")
+		}
+		c.acl = a
+	}
 	c.sr, err = stream.Recv()
 
 	switch {
@@ -141,15 +274,22 @@ func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
 	if !s.c.HasTarget(c.target) {
 		return status.Errorf(codes.NotFound, "no such target: %q", c.target)
 	}
+	defer s.updateTargetCounts(c.target)()
 	peer, _ := peer.FromContext(stream.Context())
 	mode := c.sr.GetSubscribe().Mode
-
+	if m := mode.String(); m != "" {
+		defer s.updateTypeCounts(strings.ToLower(m))()
+	}
 	log.Infof("peer: %v target: %q subscription: %s", peer.Addr, c.target, c.sr)
 	defer log.Infof("peer: %v target %q subscription: end: %q", peer.Addr, c.target, c.sr)
 
 	c.queue = coalesce.NewQueue()
 	defer c.queue.Close()
 
+	// reject single device subscription if not allowed by ACL
+	if c.target != "*" && !c.acl.Check(c.target) {
+		return status.Errorf(codes.PermissionDenied, "not authorized for target %q", c.target)
+	}
 	// This error channel is buffered to accept errors from all goroutines spawned
 	// for this RPC.  Only the first is ever read and returned causing the RPC to
 	// terminate.
@@ -168,7 +308,8 @@ func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
 		if c.sr.GetSubscribe().GetUpdatesOnly() {
 			c.queue.Insert(syncMarker{})
 		}
-		remove := addSubscription(s.m, c.sr.GetSubscribe(), &matchClient{q: c.queue})
+		remove := addSubscription(s.m, c.sr.GetSubscribe(),
+			&matchClient{acl: c.acl, q: c.queue})
 		defer remove()
 		if !c.sr.GetSubscribe().GetUpdatesOnly() {
 			go s.processSubscription(&c)
@@ -193,18 +334,29 @@ type resp struct {
 // the Subscription RPC output stream. Streaming queries send responses for the
 // initial walk of the results as well as streamed updates and use a queue to
 // ensure order.
-func (s *Server) sendSubscribeResponse(r *resp) error {
-	notification, err := MakeSubscribeResponse(r.n.Value(), r.dup)
+func (s *Server) sendSubscribeResponse(r *resp, c *streamClient) error {
+	notification, err := s.MakeSubscribeResponse(r.n.Value(), r.dup)
 	if err != nil {
 		return status.Errorf(codes.Unknown, err.Error())
 	}
+
+	if pre := notification.GetUpdate().GetPrefix(); pre != nil {
+		if !c.acl.Check(pre.GetTarget()) {
+			// reaching here means notification is denied for sending.
+			// return with no error. function caller can continue for next one.
+			return nil
+		}
+	}
+
 	// Start the timeout before attempting to send.
-	r.t.Reset(s.timeout)
+	r.t.Reset(s.o.timeout)
 	// Clear the timeout upon sending.
 	defer r.t.Stop()
 	// An empty function in production, replaced in test to simulate flow control
 	// by blocking before send.
-	flowControlTest()
+	if s.o.flowControlTest != nil {
+		s.o.flowControlTest()
+	}
 	return r.stream.Send(notification)
 }
 
@@ -217,6 +369,7 @@ type syncMarker struct{}
 
 // cacheClient implements match.Client interface.
 type matchClient struct {
+	acl RPCACL
 	q   *coalesce.Queue
 	err error
 }
@@ -231,6 +384,7 @@ func (c matchClient) Update(n interface{}) {
 }
 
 type streamClient struct {
+	acl    RPCACL
 	target string
 	sr     *pb.SubscribeRequest
 	queue  *coalesce.Queue
@@ -242,42 +396,30 @@ type streamClient struct {
 // nodes into the coalesce queue followed by a subscriptionSync response.
 func (s *Server) processSubscription(c *streamClient) {
 	var err error
+	log.V(2).Infof("start processSubscription for %p", c)
 	// Close the cache client queue on error.
 	defer func() {
 		if err != nil {
 			log.Error(err)
-			c.queue.Close()
 			c.errC <- err
 		}
+		log.V(2).Infof("end processSubscription for %p", c)
 	}()
-	if s.subscribeSlots != nil {
-		select {
-		// Register a subscription in the channel, which will block if SubscriptionLimit queries
-		// are already in flight.
-		case s.subscribeSlots <- struct{}{}:
-		default:
-			log.V(2).Infof("subscription %s delayed waiting for 1 of %d subscription slots.", c.sr, len(s.subscribeSlots))
-			s.subscribeSlots <- struct{}{}
-			log.V(2).Infof("subscription %s resumed", c.sr)
-		}
-		// Remove subscription from the channel upon completion.
-		defer func() {
-			// Artificially hold subscription processing in tests to synchronously test limit.
-			subscriptionLimitTest()
-			<-s.subscribeSlots
-		}()
-	}
 	if !c.sr.GetSubscribe().GetUpdatesOnly() {
-		// remove the target name from the index string
-		prefix := path.ToStrings(c.sr.GetSubscribe().Prefix, true)[1:]
 		for _, subscription := range c.sr.GetSubscribe().Subscription {
-			path := append(prefix, path.ToStrings(subscription.Path, false)...)
-			s.c.Query(c.target, path, func(_ []string, l *ctree.Leaf, _ interface{}) {
+			var fullPath []string
+			fullPath, err = path.CompletePath(c.sr.GetSubscribe().GetPrefix(), subscription.GetPath())
+			if err != nil {
+				return
+			}
+			// Note that fullPath doesn't contain target name as the first element.
+			s.c.Query(c.target, fullPath, func(_ []string, l *ctree.Leaf, _ interface{}) error {
 				// Stop processing query results on error.
 				if err != nil {
-					return
+					return err
 				}
 				_, err = c.queue.Insert(l)
+				return nil
 			})
 			if err != nil {
 				return
@@ -294,12 +436,16 @@ func (s *Server) processPollingSubscription(c *streamClient) {
 	log.Infof("polling subscription: first complete response: %q", c.sr)
 	for {
 		if c.queue.IsClosed() {
+			log.Info("Terminating polling subscription due to closed client queue.")
+			c.errC <- nil
 			return
 		}
 		// Subsequent receives are only triggers to poll again. The contents of the
 		// request are completely ignored.
 		_, err := c.stream.Recv()
 		if err == io.EOF {
+			log.Info("Terminating polling subscription due to EOF.")
+			c.errC <- nil
 			return
 		}
 		if err != nil {
@@ -313,12 +459,33 @@ func (s *Server) processPollingSubscription(c *streamClient) {
 	}
 }
 
+func (s *Server) updateClientStats(client, target string, dup, queueSize int64) {
+	if s.o.stats == nil {
+		return
+	}
+	st := s.o.stats.clientStats(client, target)
+	atomic.AddInt64(&st.CoalesceCount, dup)
+	atomic.StoreInt64(&st.QueueSize, queueSize)
+	if s.o.clientStatsTest != nil {
+		s.o.clientStatsTest(dup, queueSize)
+	}
+}
+
 // sendStreamingResults forwards all streaming updates to a given streaming
 // Subscription RPC client.
 func (s *Server) sendStreamingResults(c *streamClient) {
 	ctx := c.stream.Context()
 	peer, _ := peer.FromContext(ctx)
-	t := time.NewTimer(s.timeout)
+	// The pointer is used only to disambiguate among multiple subscriptions from the
+	// same Peer and has no meaning otherwise.
+	szKey := fmt.Sprintf("%s:%p", peer.Addr, c.sr)
+	defer func() {
+		if s.o.stats != nil {
+			s.o.stats.removeClientStats(szKey)
+		}
+	}()
+
+	t := time.NewTimer(s.o.timeout)
 	// Make sure the timer doesn't expire waiting for a value to send, only
 	// waiting to send.
 	t.Stop()
@@ -344,11 +511,13 @@ func (s *Server) sendStreamingResults(c *streamClient) {
 			c.errC <- err
 			return
 		}
+		s.updateClientStats(szKey, c.target, int64(dup), int64(c.queue.Len()))
 
 		// s.processSubscription will send a sync marker, handle it separately.
 		if _, ok := item.(syncMarker); ok {
 			if err = c.stream.Send(subscribeSync); err != nil {
-				break
+				c.errC <- err
+				return
 			}
 			continue
 		}
@@ -358,17 +527,18 @@ func (s *Server) sendStreamingResults(c *streamClient) {
 			c.errC <- status.Errorf(codes.Internal, "invalid cache node: %#v", item)
 			return
 		}
+
 		if err = s.sendSubscribeResponse(&resp{
 			stream: c.stream,
 			n:      n,
 			dup:    dup,
 			t:      t,
-		}); err != nil {
+		}, c); err != nil {
 			c.errC <- err
 			return
 		}
 		// If the only target being subscribed was deleted, stop streaming.
-		if cache.IsTargetDelete(n) && c.target != "*" {
+		if isTargetDelete(n) && c.target != "*" {
 			log.Infof("Target %q was deleted. Closing stream.", c.target)
 			c.errC <- nil
 			return
@@ -376,47 +546,30 @@ func (s *Server) sendStreamingResults(c *streamClient) {
 	}
 }
 
-// MakeSubscribeResponse produces a gnmi_proto.SubscribeResponse from either
-// client.Notification or gnmi_proto.Notification
+// MakeSubscribeResponse produces a gnmi_proto.SubscribeResponse from a
+// gnmi_proto.Notification.
 //
 // This function modifies the message to set the duplicate count if it is
-// greater than 0. The funciton clones the gnmi notification if the duplicate count needs to be set.
+// greater than 0. The function clones the gnmi notification if the duplicate count needs to be set.
 // You have to be working on a cloned message if you need to modify the message in any way.
-func MakeSubscribeResponse(n interface{}, dup uint32) (*pb.SubscribeResponse, error) {
+func (s *Server) MakeSubscribeResponse(n interface{}, dup uint32) (*pb.SubscribeResponse, error) {
 	var notification *pb.Notification
-	switch cache.Type {
-	case cache.GnmiNoti:
-		var ok bool
-		notification, ok = n.(*pb.Notification)
-		if !ok {
-			return nil, status.Errorf(codes.Internal, "invalid notification type: %#v", n)
-		}
+	var ok bool
+	notification, ok = n.(*pb.Notification)
+	if !ok {
+		return nil, status.Errorf(codes.Internal, "invalid notification type: %#v", n)
+	}
 
-		// There may be multiple updates in a notification. Since duplicate count is just
-		// an indicator that coalescion is happening, not a critical data, just the first
-		// update is set with duplicate count to be on the side of efficiency.
-		// Only attempt to set the duplicate count if it is greater than 0. The default
-		// value in the message is already 0.
-		if dup > 0 && len(notification.Update) > 0 {
-			// We need a copy of the cached notification before writing a client specific
-			// duplicate count as the notification is shared across all clients.
-			notification = proto.Clone(notification).(*pb.Notification)
-			notification.Update[0].Duplicates = dup
-		}
-	case cache.ClientLeaf:
-		notification = &pb.Notification{}
-		switch v := n.(type) {
-		case client.Delete:
-			notification.Delete = []*pb.Path{{Element: v.Path}}
-			notification.Timestamp = v.TS.UnixNano()
-		case client.Update:
-			typedVal, err := value.FromScalar(v.Val)
-			if err != nil {
-				return nil, err
-			}
-			notification.Update = []*pb.Update{{Path: &pb.Path{Element: v.Path}, Val: typedVal, Duplicates: dup}}
-			notification.Timestamp = v.TS.UnixNano()
-		}
+	// There may be multiple updates in a notification. Since duplicate count is just
+	// an indicator that coalescion is happening, not a critical data, just the first
+	// update is set with duplicate count to be on the side of efficiency.
+	// Only attempt to set the duplicate count if it is greater than 0. The default
+	// value in the message is already 0.
+	if !s.o.noDupReport && dup > 0 && len(notification.Update) > 0 {
+		// We need a copy of the cached notification before writing a client specific
+		// duplicate count as the notification is shared across all clients.
+		notification = proto.Clone(notification).(*pb.Notification)
+		notification.Update[0].Duplicates = dup
 	}
 	response := &pb.SubscribeResponse{
 		Response: &pb.SubscribeResponse_Update{
@@ -425,4 +578,52 @@ func MakeSubscribeResponse(n interface{}, dup uint32) (*pb.SubscribeResponse, er
 	}
 
 	return response, nil
+}
+
+func isTargetDelete(l *ctree.Leaf) bool {
+	switch v := l.Value().(type) {
+	case *pb.Notification:
+		if len(v.Delete) == 1 {
+			var orig string
+			if v.Prefix != nil {
+				orig = v.Prefix.Origin
+			}
+			// Prefix path is indexed without target and origin
+			p := path.ToStrings(v.Prefix, false)
+			p = append(p, path.ToStrings(v.Delete[0], false)...)
+			// When origin isn't set, intention must be to delete entire target.
+			return orig == "" && len(p) == 1 && p[0] == "*"
+		}
+	}
+	return false
+}
+
+// TypeStats returns statistics for all types of subscribe queries, e.g.
+// stream, once, or poll. Statistics is available only if the Server is
+// created with NewServerWithStats.
+func (s *Server) TypeStats() map[string]TypeStats {
+	if s.o.stats == nil {
+		return nil
+	}
+	return s.o.stats.allTypeStats()
+}
+
+// TargetStats returns statistics of subscribe queries for all targets.
+// Statistics is available only if the Server is created with
+// NewServerWithStats.
+func (s *Server) TargetStats() map[string]TargetStats {
+	if s.o.stats == nil {
+		return nil
+	}
+	return s.o.stats.allTargetStats()
+}
+
+// ClientStats returns states of all subscribe clients such as queue size,
+// coalesce count. Statistics is available only if the Server is created
+// with NewServerWithStats.
+func (s *Server) ClientStats() map[string]ClientStats {
+	if s.o.stats == nil {
+		return nil
+	}
+	return s.o.stats.allClientStats()
 }

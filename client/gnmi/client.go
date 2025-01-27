@@ -22,17 +22,21 @@ limitations under the License.
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"strings"
 	"time"
 
 	"context"
 	log "github.com/golang/glog"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
+	"github.com/openconfig/ygot/ygot"
 	"github.com/openconfig/gnmi/client"
-	"github.com/openconfig/gnmi/client/grpcutil"
 	"github.com/openconfig/gnmi/path"
 	"github.com/openconfig/gnmi/value"
 	"github.com/openconfig/ygot/ygot"
@@ -41,6 +45,10 @@ import (
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 )
+
+// ToSubscribeRequest is the function used to convert a client.Query into
+// a *gpb.SubscribeRequest. It can be stubbed for unit test.
+var ToSubscribeRequest = subscribe
 
 // Type defines the name resolution for this client type.
 const Type = "gnmi"
@@ -59,11 +67,12 @@ type Client struct {
 // New returns a new initialized client. If error is nil, returned Client has
 // established a connection to d. Close needs to be called for cleanup.
 func New(ctx context.Context, d client.Destination) (client.Impl, error) {
-	if len(d.Addrs) != 1 {
-		return nil, fmt.Errorf("d.Addrs must only contain one entry: %v", d.Addrs)
+	if d.TunnelConn == nil {
+		if len(d.Addrs) != 1 {
+			return nil, fmt.Errorf("d.Addrs must only contain one entry: %v", d.Addrs)
+		}
 	}
 	opts := []grpc.DialOption{
-		grpc.WithTimeout(d.Timeout),
 		grpc.WithBlock(),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 	}
@@ -76,29 +85,36 @@ func New(ctx context.Context, d client.Destination) (client.Impl, error) {
 	}
 
 	if d.Credentials != nil {
-		pc := newPassCred(d.Credentials.Username, d.Credentials.Password, true)
+		secure := true
+		if d.TLS == nil {
+			secure = false
+		}
+		pc := newPassCred(d.Credentials.Username, d.Credentials.Password, secure)
 		opts = append(opts, grpc.WithPerRPCCredentials(pc))
 	}
-	conn, err := grpc.DialContext(ctx, d.Addrs[0], opts...)
+
+	gCtx, cancel := context.WithTimeout(ctx, d.Timeout)
+	defer cancel()
+
+	if d.TunnelConn != nil {
+		withContextDialer := grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return d.TunnelConn, nil
+		})
+		opts = append(opts, withContextDialer)
+	}
+	addr := ""
+	if len(d.Addrs) != 0 {
+		addr = d.Addrs[0]
+	}
+	conn, err := grpc.DialContext(gCtx, addr, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("Dialer(%s, %v): %v", d.Addrs[0], d.Timeout, err)
+		return nil, fmt.Errorf("Dialer(%s, %v): %v", addr, d.Timeout, err)
 	}
 	return NewFromConn(ctx, conn, d)
 }
 
 // NewFromConn creates and returns the client based on the provided transport.
 func NewFromConn(ctx context.Context, conn *grpc.ClientConn, d client.Destination) (*Client, error) {
-	ok, err := grpcutil.Lookup(ctx, conn, "gnmi.gNMI")
-	if err != nil {
-		log.V(1).Infof("gRPC reflection lookup on %q for service gnmi.gNMI failed: %v", d.Addrs, err)
-		// This check is disabled for now. Reflection will become part of gNMI
-		// specification in the near future, so we can't enforce it yet.
-	}
-	if !ok {
-		// This check is disabled for now. Reflection will become part of gNMI
-		// specification in the near future, so we can't enforce it yet.
-	}
-
 	cl := gpb.NewGNMIClient(conn)
 	return &Client{
 		conn:   conn,
@@ -115,7 +131,7 @@ func (c *Client) Subscribe(ctx context.Context, q client.Query) error {
 
 	sr := q.SubReq
 	if sr == nil {
-		sr, err = subscribe(q)
+		sr, err = ToSubscribeRequest(q)
 		if err != nil {
 			return fmt.Errorf("generating SubscribeRequest proto: %v", err)
 		}
@@ -324,7 +340,7 @@ func noti(prefix []string, pp *gpb.Path, ts time.Time, u *gpb.Update) (client.No
 	if u.Val != nil {
 		val, err := toScalar(u.Val)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to decode %s: %v", p, err)
 		}
 		return client.Update{Path: p, TS: ts, Val: val, Dups: u.Duplicates}, nil
 	}
@@ -344,52 +360,6 @@ func noti(prefix []string, pp *gpb.Path, ts time.Time, u *gpb.Update) (client.No
 
 func init() {
 	client.Register(Type, New)
-}
-
-// ProtoResponse converts client library Notification types into gNMI
-// SubscribeResponse proto. An error is returned if any notifications have
-// invalid paths or if update values can't be converted to gpb.TypedValue.
-func ProtoResponse(notifs ...client.Notification) (*gpb.SubscribeResponse, error) {
-	n := new(gpb.Notification)
-
-	for _, nn := range notifs {
-		switch nn := nn.(type) {
-		case client.Update:
-			if n.Timestamp == 0 {
-				n.Timestamp = nn.TS.UnixNano()
-			}
-			pp, err := ygot.StringToPath(pathToString(nn.Path), ygot.StructuredPath, ygot.StringSlicePath)
-			if err != nil {
-				return nil, err
-			}
-			v, err := value.FromScalar(nn.Val)
-			if err != nil {
-				return nil, err
-			}
-
-			n.Update = append(n.Update, &gpb.Update{
-				Path: pp,
-				Val:  v,
-			})
-
-		case client.Delete:
-			if n.Timestamp == 0 {
-				n.Timestamp = nn.TS.UnixNano()
-			}
-
-			pp, err := ygot.StringToPath(pathToString(nn.Path), ygot.StructuredPath, ygot.StringSlicePath)
-			if err != nil {
-				return nil, err
-			}
-			n.Delete = append(n.Delete, pp)
-
-		default:
-			return nil, fmt.Errorf("gnmi.ProtoResponse: unsupported type %T", nn)
-		}
-	}
-
-	resp := &gpb.SubscribeResponse{Response: &gpb.SubscribeResponse_Update{Update: n}}
-	return resp, nil
 }
 
 func pathToString(q client.Path) string {

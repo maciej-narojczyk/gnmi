@@ -17,13 +17,16 @@ limitations under the License.
 package cli
 
 import (
+	"context"
 	"crypto/tls"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"context"
 	"github.com/openconfig/gnmi/client"
 	_ "github.com/openconfig/gnmi/client/gnmi"
@@ -80,7 +83,7 @@ func TestSendQueryAndDisplay(t *testing.T) {
 	}{{
 		desc: "single target single output with provided layout",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -96,13 +99,14 @@ func TestSendQueryAndDisplay(t *testing.T) {
 			DisplayIndent: "  ",
 			DisplayType:   "single",
 			Timestamp:     "2006-01-02-15:04:05",
+			Location:      time.UTC, // make tests deterministic across different local time zones
 		},
-		want: `dev1/a/b, 5, 1969-12-31-16:00:00
+		want: `dev1/a/b, 5, 1970-01-01-00:00:00
 `,
 	}, {
 		desc: "single target single output with timestamp on",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -118,13 +122,14 @@ func TestSendQueryAndDisplay(t *testing.T) {
 			DisplayIndent: "  ",
 			DisplayType:   "single",
 			Timestamp:     "on",
+			Location:      time.UTC, // make tests deterministic across different local time zones
 		},
-		want: `dev1/a/b, 5, 1969-12-31-16:00:00.000000100
+		want: `dev1/a/b, 5, 1970-01-01-00:00:00.000000100
 `,
 	}, {
 		desc: "single target single output",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -143,9 +148,35 @@ func TestSendQueryAndDisplay(t *testing.T) {
 		want: `dev1/a/b, 5
 `,
 	}, {
-		desc: "single target group output",
+		desc: "single target group output with comment prefix",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: math.Inf(0)}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
+		},
+		query: client.Query{
+			Target:  "dev1",
+			Queries: []client.Path{{"a"}},
+			Type:    client.Once,
+			TLS:     &tls.Config{InsecureSkipVerify: true},
+		},
+		cfg: Config{
+			Display:       display,
+			DisplayPrefix: "# ",
+			DisplayIndent: "  ",
+			DisplayType:   "group",
+		},
+		want: `# {
+#   "dev1": {
+#     "a": {
+#       "b": +Inf
+#     }
+#   }
+# }
+`,
+	}, {
+		desc: "single target group output with list value",
+		updates: []*fpb.Value{
+			{Path: []string{"a", "b"}, Value: &fpb.Value_StringListValue{StringListValue: &fpb.StringListValue{Value: []string{"c", "d or e"}}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -163,7 +194,7 @@ func TestSendQueryAndDisplay(t *testing.T) {
 		want: `{
   "dev1": {
     "a": {
-      "b": 5
+      "b": ["c", "d or e"]
     }
   }
 }
@@ -171,7 +202,7 @@ func TestSendQueryAndDisplay(t *testing.T) {
 	}, {
 		desc: "single target single output with peer",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -199,7 +230,7 @@ func TestSendQueryAndDisplay(t *testing.T) {
 	}, {
 		desc: "single target single output with latency",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -221,9 +252,9 @@ func TestSendQueryAndDisplay(t *testing.T) {
 	}, {
 		desc: "single target single output with delete",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
-			{Path: []string{"dev1", "a", "c"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
-			{Path: []string{"dev1", "a", "c"}, Value: &fpb.Value_Delete{Delete: &fpb.DeleteValue{}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 200}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "c"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "c"}, Value: &fpb.Value_Delete{Delete: &fpb.DeleteValue{}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 200}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -246,13 +277,13 @@ dev1/a/c, <nil>
 	}, {
 		desc: "single target multiple paths",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			// The following is disallowed because the tree already has a branch where
 			// this leaf requests to be, thus dropped.
-			{Path: []string{"dev1", "a"}, Value: &fpb.Value_StringValue{StringValue: &fpb.StringValue{Value: "foo"}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 105}},
+			{Path: []string{"a"}, Value: &fpb.Value_StringValue{StringValue: &fpb.StringValue{Value: "foo"}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 105}},
 			// The following is disallowed because the tree already has a leaf where
 			// this branch requests to be, thus dropped.
-			{Path: []string{"dev1", "a", "b", "c"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: 3.14}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b", "c"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: 3.14}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -278,7 +309,7 @@ dev1/a/c, <nil>
 	}, {
 		desc: "single target single paths (proto)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000000}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000000}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -288,30 +319,33 @@ dev1/a/c, <nil>
 			TLS:     &tls.Config{InsecureSkipVerify: true},
 		},
 		cfg: Config{
-			Display:     display,
-			DisplayType: "proto",
+			Display:       display,
+			DisplayType:   "proto",
+			DisplayIndent: "  ",
 		},
 		want: `sync_response: true
 
-update: <
+update: {
   timestamp: 1440807212000000000
-  update: <
-    path: <
-      element: "dev1"
+  prefix: {
+    target: "dev1"
+  }
+  update: {
+    path: {
       element: "a"
       element: "b"
-    >
-    val: <
+    }
+    val: {
       int_val: 5
-    >
-  >
->
+    }
+  }
+}
 
 `,
 	}, {
 		desc: "single target single paths (proto) with size",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000000}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000000}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -321,32 +355,35 @@ update: <
 			TLS:     &tls.Config{InsecureSkipVerify: true},
 		},
 		cfg: Config{
-			Display:     display,
-			DisplayType: "proto",
-			DisplaySize: true,
+			Display:       display,
+			DisplayType:   "proto",
+			DisplaySize:   true,
+			DisplayIndent: "  ",
 		},
 		want: `sync_response: true
 
-update: <
+update: {
   timestamp: 1440807212000000000
-  update: <
-    path: <
-      element: "dev1"
+  prefix: {
+    target: "dev1"
+  }
+  update: {
+    path: {
       element: "a"
       element: "b"
-    >
-    val: <
+    }
+    val: {
       int_val: 5
-    >
-  >
->
+    }
+  }
+}
 
-// total response size: 34
+// total response size: 36
 `,
 	}, {
 		desc: "single target multiple paths (with timestamp)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000000}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000000}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000001}},
 		},
 		query: client.Query{
@@ -361,12 +398,13 @@ update: <
 			DisplayIndent: "  ",
 			DisplayType:   "group",
 			Timestamp:     "on",
+			Location:      time.UTC, // make tests deterministic across different local time zones
 		},
 		want: `{
   "dev1": {
     "a": {
       "b": {
-        "timestamp": "2015-08-28-17:13:32.000000000",
+        "timestamp": "2015-08-29-00:13:32.000000000",
         "value": 5
       }
     }
@@ -376,7 +414,7 @@ update: <
 	}, {
 		desc: "single target multiple paths (with raw timestamp)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -406,7 +444,7 @@ update: <
 	}, {
 		desc: "single target multiple paths (with DoW timestamp)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000000}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000000}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 1440807212000000001}},
 		},
 		query: client.Query{
@@ -421,12 +459,13 @@ update: <
 			DisplayIndent: "  ",
 			DisplayType:   "group",
 			Timestamp:     "Monday",
+			Location:      time.UTC, // make tests deterministic across different local time zones
 		},
 		want: `{
   "dev1": {
     "a": {
       "b": {
-        "timestamp": "Friday",
+        "timestamp": "Saturday",
         "value": 5
       }
     }
@@ -436,9 +475,9 @@ update: <
 	}, {
 		desc: "single target multiple root paths",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
-			{Path: []string{"dev1", "a", "c"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: 3.25}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 101}},
-			{Path: []string{"dev1", "d", "e", "f"}, Value: &fpb.Value_StringValue{StringValue: &fpb.StringValue{Value: "foo"}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 102}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "c"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: 3.25}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 101}},
+			{Path: []string{"d", "e", "f"}, Value: &fpb.Value_StringValue{StringValue: &fpb.StringValue{Value: "foo"}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 102}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -470,7 +509,7 @@ update: <
 	}, {
 		desc: "single target multiple paths (Pollingx2)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -505,7 +544,7 @@ update: <
 	}, {
 		desc: "single target multiple paths (streaming)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -533,10 +572,55 @@ update: <
 }
 `,
 	}, {
+		desc: "single target multiple paths with timestamp format (streaming)",
+		updates: []*fpb.Value{
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 6}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 400}},
+		},
+		query: client.Query{
+			Target:  "dev1",
+			Queries: []client.Path{{"a"}},
+			Type:    client.Stream,
+			TLS:     &tls.Config{InsecureSkipVerify: true},
+		},
+		cfg: Config{
+			Display:       display,
+			DisplayPrefix: "",
+			DisplayIndent: "  ",
+			DisplayType:   "group",
+			// StreamingDuration will expire before Count updates are received because
+			// no updates are being streamed in the test.
+			Count:             3,
+			StreamingDuration: 100 * time.Millisecond,
+			Timestamp:         "raw",
+		},
+		want: `{
+  "dev1": {
+    "a": {
+      "b": {
+        "timestamp": 100,
+        "value": 5
+      }
+    }
+  }
+}
+{
+  "dev1": {
+    "a": {
+      "b": {
+        "timestamp": 400,
+        "value": 6
+      }
+    }
+  }
+}
+`,
+	}, {
 		desc: "single target multiple paths (single line)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
-			{Path: []string{"dev1", "a", "c"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: 3.25}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 101}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "c"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: 3.25}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 101}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -559,8 +643,8 @@ dev1/a/c, 3.25
 	}, {
 		desc: "single target multiple paths (single line raw)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
-			{Path: []string{"dev1", "a", "c"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: 3.25}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 101}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "c"}, Value: &fpb.Value_DoubleValue{DoubleValue: &fpb.DoubleValue{Value: 3.25}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 101}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -584,7 +668,7 @@ dev1.a.c, 3.25, 101
 	}, {
 		desc: "single target multiple paths (proto short)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -597,13 +681,13 @@ dev1.a.c, 3.25, 101
 			Display:     display,
 			DisplayType: "shortproto",
 		},
-		want: `update:<timestamp:100 update:<path:<element:"dev1" element:"a" element:"b" > val:<int_val:5 > > >
-sync_response:true
+		want: `update: { timestamp: 100 prefix: { target: "dev1" } update: { path: { element: "a" element: "b" } val: { int_val: 5 } } }
+sync_response: true
 `,
 	}, {
 		desc: "single target multiple paths (with display size)",
 		updates: []*fpb.Value{
-			{Path: []string{"dev1", "a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
+			{Path: []string{"a", "b"}, Value: &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 100}},
 			{Value: &fpb.Value_Sync{Sync: 1}, Repeat: 1, Timestamp: &fpb.Timestamp{Timestamp: 300}},
 		},
 		query: client.Query{
@@ -647,7 +731,6 @@ sync_response:true
 			if err != nil {
 				t.Fatal("failed to start test server")
 			}
-			go s.Serve()
 			defer s.Close()
 
 			tt.query.Addrs = []string{s.Address()}
@@ -670,7 +753,6 @@ sync_response:true
 				lines = append(lines[1:], lines[0])
 				got = strings.Join(lines, "\n")
 			}
-
 			if got != tt.want {
 				t.Errorf("sendQueryAndDisplay(ctx, address, %v, %v):\ngot(%d):\n%s\nwant(%d):\n%s", tt.query, tt.cfg, len(got), got, len(tt.want), tt.want)
 			}
@@ -693,17 +775,17 @@ func TestGNMIClient(t *testing.T) {
 	}{{
 		desc: "single target single output with provided layout",
 		updates: []*fpb.Value{{
-			Path:      []string{"dev", "a"},
+			Path:      []string{"a"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 200},
 			Repeat:    1,
 			Value:     &fpb.Value_Delete{Delete: &fpb.DeleteValue{}},
@@ -713,7 +795,7 @@ func TestGNMIClient(t *testing.T) {
 			Value:     &fpb.Value_Sync{Sync: 1},
 		}},
 		query: client.Query{
-			Target:  "dev1",
+			Target:  "dev",
 			Queries: []client.Path{{"a"}},
 			Type:    client.Once,
 			Timeout: 3 * time.Second,
@@ -726,25 +808,26 @@ func TestGNMIClient(t *testing.T) {
 			DisplayIndent: "  ",
 			DisplayType:   "single",
 			Timestamp:     "2006-01-02-15:04:05",
+			Location:      time.UTC, // make tests deterministic across different local time zones
 		},
-		want: `dev/a, 5, 1969-12-31-16:00:00
-dev/a/b, 5, 1969-12-31-16:00:00
-dev/a/b, <nil>, 1969-12-31-16:00:00
+		want: `dev/a, 5, 1970-01-01-00:00:00
+dev/a/b, 5, 1970-01-01-00:00:00
+dev/a/b, <nil>, 1970-01-01-00:00:00
 `,
 	}, {
 		desc: "single target group output with provided layout",
 		updates: []*fpb.Value{{
-			Path:      []string{"dev", "a"},
+			Path:      []string{"a"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 200},
 			Repeat:    1,
 			Value:     &fpb.Value_Delete{Delete: &fpb.DeleteValue{}},
@@ -754,7 +837,7 @@ dev/a/b, <nil>, 1969-12-31-16:00:00
 			Value:     &fpb.Value_Sync{Sync: 1},
 		}},
 		query: client.Query{
-			Target:  "dev1",
+			Target:  "dev",
 			Queries: []client.Path{{"a"}},
 			Type:    client.Once,
 			Timeout: 3 * time.Second,
@@ -767,11 +850,12 @@ dev/a/b, <nil>, 1969-12-31-16:00:00
 			DisplayIndent: "  ",
 			DisplayType:   "group",
 			Timestamp:     "2006-01-02-15:04:05",
+			Location:      time.UTC, // make tests deterministic across different local time zones
 		},
 		want: `{
   "dev": {
     "a": {
-      "timestamp": "1969-12-31-16:00:00",
+      "timestamp": "1970-01-01-00:00:00",
       "value": 5
     }
   }
@@ -780,17 +864,17 @@ dev/a/b, <nil>, 1969-12-31-16:00:00
 	}, {
 		desc: "single target multiple paths (proto short)",
 		updates: []*fpb.Value{{
-			Path:      []string{"dev", "a"},
+			Path:      []string{"a"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 100},
 			Repeat:    1,
 			Value:     &fpb.Value_IntValue{IntValue: &fpb.IntValue{Value: 5}},
 		}, {
-			Path:      []string{"dev", "a", "b"},
+			Path:      []string{"a", "b"},
 			Timestamp: &fpb.Timestamp{Timestamp: 200},
 			Repeat:    1,
 			Value:     &fpb.Value_Delete{Delete: &fpb.DeleteValue{}},
@@ -810,10 +894,10 @@ dev/a/b, <nil>, 1969-12-31-16:00:00
 			Display:     display,
 			DisplayType: "shortproto",
 		},
-		want: `update:<timestamp:100 update:<path:<element:"dev" element:"a" > val:<int_val:5 > > >
-update:<timestamp:100 update:<path:<element:"dev" element:"a" element:"b" > val:<int_val:5 > > >
-update:<timestamp:200 delete:<element:"dev" element:"a" element:"b" > >
-sync_response:true
+		want: `update: { timestamp: 100 prefix: { target: "dev1" } update: { path: { element: "a" } val: { int_val: 5 } } }
+update: { timestamp: 100 prefix: { target: "dev1" } update: { path: { element: "a" element: "b" } val: { int_val: 5 } } }
+update: { timestamp: 200 prefix: { target: "dev1" } delete: { element: "a" element: "b" } }
+sync_response: true
 `,
 	}}
 	opt, err := config.WithSelfTLSCert()
@@ -834,7 +918,6 @@ sync_response:true
 			if err != nil {
 				t.Fatal("failed to start test server")
 			}
-			go s.Serve()
 			defer s.Close()
 
 			tt.query.Addrs = []string{s.Address()}

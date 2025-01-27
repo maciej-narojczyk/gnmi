@@ -19,20 +19,21 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
-	"context"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
 	"github.com/openconfig/gnmi/client"
 	"github.com/openconfig/gnmi/ctree"
+	"github.com/protocolbuffers/txtpbfmt/parser"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 )
-
-const layout = "2006-01-02-15:04:05.000000000"
 
 var (
 	queryTypeMap = map[string]client.Type{
@@ -68,8 +69,9 @@ type Config struct {
 	// <FORMAT> - human readable timestamp according to <FORMAT>
 	Timestamp     string // Formatting of timestamp in result output.
 	DisplaySize   bool
-	Latency       bool     // Show latency to client
-	ClientTypes   []string // List of client types to try.
+	Latency       bool           // Show latency to client
+	ClientTypes   []string       // List of client types to try.
+	Location    *time.Location // Location that time formatting uses in lieu of the local time zone.
 	Concurrent    uint     // Number of concurrent client connections to server, for graph display type only.
 	ConcurrentMax uint     // Double number of concurrent client connections until MaxConcurrent reached.
 }
@@ -95,14 +97,28 @@ func QueryDisplay(ctx context.Context, query client.Query, cfg *Config) error {
 func ParseSubscribeProto(p string) (client.Query, error) {
 	var tq client.Query
 	sr := &gpb.SubscribeRequest{}
-	if err := proto.UnmarshalText(p, sr); err != nil {
+	if err := prototext.Unmarshal([]byte(p), sr); err != nil {
 		return tq, err
 	}
 	return client.NewQuery(sr)
 }
 
+// fixStability fixes the broken stability in the prototext.Marshal output.
+func fixStability(m prototext.MarshalOptions, r proto.Message) []byte {
+	b, err := m.Marshal(r)
+	if err != nil {
+		return []byte(fmt.Sprintf("failed to marshal %s: %v", r, err))
+	}
+	b, err = parser.Format(b)
+	if err != nil {
+		return []byte(fmt.Sprintf("failed to format %s: %v", r, err))
+	}
+	return b
+}
+
 // sendQueryAndDisplay directs a query to the specified target. The returned
-// results are formatted as a JSON string and passed to Config.Display().
+// results are formatted as a human readable string and passed to
+// Config.Display().
 func sendQueryAndDisplay(ctx context.Context, query client.Query, cfg *Config) error {
 	cancel := func() {}
 	if cfg.StreamingDuration > 0 {
@@ -117,14 +133,14 @@ func sendQueryAndDisplay(ctx context.Context, query client.Query, cfg *Config) e
 	case "SINGLE":
 		return displaySingleResults(ctx, query, cfg)
 	case "PROTO":
+		m := prototext.MarshalOptions{EmitASCII: true, Multiline: true, Indent: "  ", AllowPartial: true, EmitUnknown: true}
 		return displayProtoResults(ctx, query, cfg, func(r proto.Message) []byte {
-			return []byte(proto.MarshalTextString(r))
+			return fixStability(m, r)
 		})
 	case "SHORTPROTO":
+		m := prototext.MarshalOptions{EmitASCII: true, Multiline: false, AllowPartial: true, EmitUnknown: true}
 		return displayProtoResults(ctx, query, cfg, func(r proto.Message) []byte {
-			// r.String() will add extra whitespace at the end for some reason.
-			// Trim it down.
-			return bytes.TrimSpace([]byte(r.String()))
+			return bytes.TrimSpace(fixStability(m, r))
 		})
 	case "GRAPH":
 		if query.Type == client.Poll {
@@ -157,16 +173,7 @@ func genHandler(cfg *Config) client.NotificationHandler {
 		buf.Reset()
 		buf.WriteString(strings.Join(p, cfg.Delimiter))
 		buf.WriteString(fmt.Sprintf(", %v", v))
-		var t interface{}
-		switch cfg.Timestamp {
-		default: // Assume user has passed a valid layout for time.Format
-			t = ts.Format(cfg.Timestamp)
-		case "": // Timestamp disabled.
-		case "on":
-			t = ts.Format(layout)
-		case "raw":
-			t = ts.UnixNano()
-		}
+		t := formatTime(ts, cfg)
 		if t != nil {
 			buf.WriteString(fmt.Sprintf(", %v", t))
 		}
@@ -243,7 +250,8 @@ func displayPeer(c client.Client, cfg *Config) {
 }
 
 // displayOnceResults builds all the results returned for for one application of
-// query to the OpenConfig data tree and displays the resulting tree in JSON.
+// query to the OpenConfig data tree and displays the resulting tree in a human
+// readable form.
 func displayOnceResults(ctx context.Context, query client.Query, cfg *Config) error {
 	c := client.New()
 	if err := c.Subscribe(ctx, query, cfg.ClientTypes...); err != nil {
@@ -303,18 +311,13 @@ func displayStreamingResults(ctx context.Context, query client.Query, cfg *Confi
 			return
 		}
 		b := make(pathmap)
-		if cfg.Timestamp != "" {
-			b.add(append(path, "timestamp"), ts)
+		if t := formatTime(ts, cfg); t != nil {
+			b.add(append(path, "timestamp"), t)
 			b.add(append(path, "value"), val)
 		} else {
 			b.add(path, val)
 		}
-		result, err := json.MarshalIndent(b, cfg.DisplayPrefix, cfg.DisplayIndent)
-		if err != nil {
-			cfg.Display([]byte(fmt.Sprintf("Error: failed to marshal result: %v", err)))
-			return
-		}
-		cfg.Display(result)
+		cfg.Display(b.display(cfg.DisplayPrefix, cfg.DisplayIndent))
 	}
 	query.NotificationHandler = func(n client.Notification) error {
 		switch v := n.(type) {
@@ -328,6 +331,9 @@ func displayStreamingResults(ctx context.Context, query client.Query, cfg *Confi
 		case client.Error:
 			cfg.Display([]byte(fmt.Sprintf("Error: %v", v)))
 		}
+		if countComplete(cfg) {
+			return errors.New("requested update count reached")
+		}
 		return nil
 	}
 	return c.Subscribe(ctx, query, cfg.ClientTypes...)
@@ -335,48 +341,21 @@ func displayStreamingResults(ctx context.Context, query client.Query, cfg *Confi
 
 func displayWalk(target string, c *client.CacheClient, cfg *Config) {
 	b := make(pathmap)
-	var addFunc func(path []string, v client.TreeVal)
-	switch cfg.Timestamp {
-	default:
-		addFunc = func(path []string, v client.TreeVal) {
-			b.add(path, map[string]interface{}{
-				"value":     v.Val,
-				"timestamp": v.TS.Format(cfg.Timestamp),
-			})
-		}
-	case "on":
-		addFunc = func(path []string, v client.TreeVal) {
-			b.add(path, map[string]interface{}{
-				"value":     v.Val,
-				"timestamp": v.TS.Format(layout),
-			})
-		}
-	case "raw":
-		addFunc = func(path []string, v client.TreeVal) {
-			b.add(path, map[string]interface{}{
-				"value":     v.Val,
-				"timestamp": v.TS.UnixNano(),
-			})
-		}
-	case "off", "":
-		addFunc = func(path []string, v client.TreeVal) {
-			b.add(path, v.Val)
-		}
-	}
-	c.WalkSorted(func(path []string, _ *ctree.Leaf, value interface{}) {
+	c.WalkSorted(func(path []string, _ *ctree.Leaf, value interface{}) error {
 		switch v := value.(type) {
 		default:
 			b.add(path, fmt.Sprintf("INVALID NODE %#v", value))
 		case *ctree.Tree:
 		case client.TreeVal:
-			addFunc(path, v)
+			var val interface{} = v.Val
+			if t := formatTime(v.TS, cfg); t != nil {
+				val = pathmap{"value": v.Val, "timestamp": t}
+			}
+			b.add(path, val)
 		}
+		return nil
 	})
-	result, err := json.MarshalIndent(b, cfg.DisplayPrefix, cfg.DisplayIndent)
-	if err != nil {
-		cfg.Display([]byte(fmt.Sprintf("Error: failed to marshal result: %v", err)))
-		return
-	}
+	result := b.display(cfg.DisplayPrefix, cfg.DisplayIndent)
 	cfg.Display(result)
 	if cfg.DisplaySize {
 		cfg.Display([]byte(fmt.Sprintf("// total response size: %d", len(result))))
@@ -384,6 +363,40 @@ func displayWalk(target string, c *client.CacheClient, cfg *Config) {
 }
 
 type pathmap map[string]interface{}
+
+func (m pathmap) display(prefix, indent string) []byte {
+	return []byte(prefix + m.str(prefix, indent, ""))
+}
+
+func valStr(val interface{}, prefix, indent, curindent string) string {
+	switch v := val.(type) {
+	case pathmap:
+		return v.str(prefix, indent, curindent+indent)
+	case string:
+		return fmt.Sprintf("%q", v)
+	case []interface{}:
+		vals := make([]string, len(v))
+		for i := 0; i < len(v); i++ {
+			vals[i] = valStr(v[i], prefix, indent, curindent)
+		}
+		return fmt.Sprintf("[%s]", strings.Join(vals, ", "))
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func (m pathmap) str(prefix, indent, curindent string) string {
+	var keys []string
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var vals []string
+	for _, key := range keys {
+		vals = append(vals, prefix+curindent+indent+fmt.Sprintf("%q: %s", key, valStr(m[key], prefix, indent, curindent)))
+	}
+	return "{\n" + strings.Join(vals, ",\n") + "\n" + prefix + curindent + "}"
+}
 
 func (m pathmap) add(path []string, v interface{}) {
 	if len(path) == 1 {
@@ -397,4 +410,21 @@ func (m pathmap) add(path []string, v interface{}) {
 	}
 	mm.(pathmap).add(path[1:], v)
 	m[path[0]] = mm
+}
+
+func formatTime(ts time.Time, cfg *Config) interface{} {
+	const layout = "2006-01-02-15:04:05.000000000"
+	if cfg.Location != nil {
+		ts = ts.In(cfg.Location)
+	}
+	switch cfg.Timestamp {
+	default: // Assume user has passed a valid layout for time.Format
+		return ts.Format(cfg.Timestamp)
+	case "": // Timestamp disabled.
+	case "on":
+		return ts.Format(layout)
+	case "raw":
+		return ts.UnixNano()
+	}
+	return nil
 }

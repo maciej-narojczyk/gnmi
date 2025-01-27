@@ -20,9 +20,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
+	"google.golang.org/protobuf/proto"
+
 	pb "github.com/openconfig/gnmi/proto/gnmi"
+	anypb "google.golang.org/protobuf/types/known/anypb"
 )
 
 type scalarTest struct {
@@ -45,10 +46,10 @@ func TestFromScalar(t *testing.T) {
 		{intf: uint16(500), msg: &pb.TypedValue{Value: &pb.TypedValue_UintVal{500}}},
 		{intf: uint32(500), msg: &pb.TypedValue{Value: &pb.TypedValue_UintVal{500}}},
 		{intf: uint64(500), msg: &pb.TypedValue{Value: &pb.TypedValue_UintVal{500}}},
-		{intf: float32(3.5), msg: &pb.TypedValue{Value: &pb.TypedValue_FloatVal{3.5}}},
+		{intf: float32(3.5), msg: &pb.TypedValue{Value: &pb.TypedValue_DoubleVal{3.5}}},
 		{intf: true, msg: &pb.TypedValue{Value: &pb.TypedValue_BoolVal{true}}},
 		{intf: false, msg: &pb.TypedValue{Value: &pb.TypedValue_BoolVal{false}}},
-		{intf: float64(3.5), msg: &pb.TypedValue{Value: &pb.TypedValue_FloatVal{3.5}}},
+		{intf: float64(3.5), msg: &pb.TypedValue{Value: &pb.TypedValue_DoubleVal{3.5}}},
 		{intf: []byte("foo"), msg: &pb.TypedValue{Value: &pb.TypedValue_BytesVal{[]byte("foo")}}},
 		{intf: "a non-utf-8 string \377", err: true},
 		{
@@ -109,6 +110,7 @@ func TestToScalar(t *testing.T) {
 		{intf: int64(500), msg: &pb.TypedValue{Value: &pb.TypedValue_IntVal{500}}},
 		{intf: uint64(500), msg: &pb.TypedValue{Value: &pb.TypedValue_UintVal{500}}},
 		{intf: float32(3.5), msg: &pb.TypedValue{Value: &pb.TypedValue_FloatVal{3.5}}},
+		{intf: float64(4.5), msg: &pb.TypedValue{Value: &pb.TypedValue_DoubleVal{4.5}}},
 		{intf: true, msg: &pb.TypedValue{Value: &pb.TypedValue_BoolVal{true}}},
 		{intf: false, msg: &pb.TypedValue{Value: &pb.TypedValue_BoolVal{false}}},
 		{
@@ -174,6 +176,24 @@ func TestToScalar(t *testing.T) {
 		{msg: &pb.TypedValue{Value: &pb.TypedValue_AnyVal{}}, err: true},
 		{msg: &pb.TypedValue{Value: &pb.TypedValue_JsonVal{}}, err: true},
 		{msg: &pb.TypedValue{Value: &pb.TypedValue_JsonIetfVal{}}, err: true},
+		{
+			msg: &pb.TypedValue{Value: &pb.TypedValue_JsonVal{
+				JsonVal: []byte(`{"a":1,"b":"foo"}`)},
+			},
+			intf: DeprecatedScalar{
+				Message: "Deprecated TypedValue_JsonVal",
+				Value:   map[string]interface{}{"a": float64(1), "b": "foo"},
+			},
+		},
+		{
+			msg: &pb.TypedValue{Value: &pb.TypedValue_JsonIetfVal{
+				JsonIetfVal: []byte(`{"a":1,"b":"foo"}`)},
+			},
+			intf: DeprecatedScalar{
+				Message: "Deprecated TypedValue_JsonIetfVal",
+				Value:   map[string]interface{}{"a": float64(1), "b": "foo"},
+			},
+		},
 		{msg: &pb.TypedValue{Value: &pb.TypedValue_AsciiVal{}}, err: true},
 	}
 	for _, tt := range tests {
@@ -192,9 +212,9 @@ func TestToScalar(t *testing.T) {
 }
 
 func TestEqual(t *testing.T) {
-	anyVal, err := ptypes.MarshalAny(&pb.TypedValue{Value: &pb.TypedValue_StringVal{"any val"}})
-	if err != nil {
-		t.Errorf("MarshalAny: %v", err)
+	anyVal := &anypb.Any{}
+	if err := anypb.MarshalFrom(anyVal, &pb.TypedValue{Value: &pb.TypedValue_StringVal{"any val"}}, proto.MarshalOptions{}); err != nil {
+		t.Fatalf("MarshalAny: %v", err)
 	}
 	for _, test := range []struct {
 		name string
@@ -226,6 +246,11 @@ func TestEqual(t *testing.T) {
 			name: "Bytes equal",
 			a:    &pb.TypedValue{Value: &pb.TypedValue_BytesVal{[]byte{1, 2, 3}}},
 			b:    &pb.TypedValue{Value: &pb.TypedValue_BytesVal{[]byte{1, 2, 3}}},
+			want: true,
+		}, {
+			name: "Double equal",
+			a:    &pb.TypedValue{Value: &pb.TypedValue_DoubleVal{1234.56789123456}},
+			b:    &pb.TypedValue{Value: &pb.TypedValue_DoubleVal{1234.56789123456}},
 			want: true,
 		}, {
 			name: "Float equal",
@@ -265,6 +290,10 @@ func TestEqual(t *testing.T) {
 			a:    &pb.TypedValue{Value: &pb.TypedValue_BytesVal{[]byte{2, 3}}},
 			b:    &pb.TypedValue{Value: &pb.TypedValue_BytesVal{[]byte{1, 2, 3}}},
 		}, {
+			name: "Double not equal",
+			a:    &pb.TypedValue{Value: &pb.TypedValue_DoubleVal{12340.56789}},
+			b:    &pb.TypedValue{Value: &pb.TypedValue_DoubleVal{1234.56789}},
+		}, {
 			name: "Float not equal",
 			a:    &pb.TypedValue{Value: &pb.TypedValue_FloatVal{12340.56789}},
 			b:    &pb.TypedValue{Value: &pb.TypedValue_FloatVal{1234.56789}},
@@ -293,6 +322,10 @@ func TestEqual(t *testing.T) {
 			a:    &pb.TypedValue{Value: &pb.TypedValue_BoolVal{true}},
 			b:    &pb.TypedValue{Value: &pb.TypedValue_DecimalVal{&pb.Decimal64{Digits: 1234, Precision: 10}}},
 		}, {
+			name: "Types not equal - Double",
+			a:    &pb.TypedValue{Value: &pb.TypedValue_FloatVal{5.25}},
+			b:    &pb.TypedValue{Value: &pb.TypedValue_DoubleVal{5.25}},
+		}, {
 			name: "Types not equal - Float",
 			a:    &pb.TypedValue{Value: &pb.TypedValue_FloatVal{5.25}},
 			b:    &pb.TypedValue{Value: &pb.TypedValue_DecimalVal{&pb.Decimal64{Digits: 1234, Precision: 10}}},
@@ -307,6 +340,10 @@ func TestEqual(t *testing.T) {
 		},
 		// Equality is not checked, expect false.
 		{
+			name: "Nil values not compared",
+			a:    nil,
+			b:    nil,
+		}, {
 			name: "Empty values not compared",
 			a:    &pb.TypedValue{},
 			b:    &pb.TypedValue{},

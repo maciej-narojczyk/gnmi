@@ -21,11 +21,11 @@ limitations under the License.
 package client
 
 import (
+	"context"
 	"fmt"
 
 	log "github.com/golang/glog"
-	"context"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"github.com/openconfig/gnmi/client"
 )
 
@@ -96,8 +96,10 @@ func (c *Client) Recv() error {
 	if c.Context == nil {
 		c.Context = context.Background()
 	}
-	if !c.connected && c.Handler != nil {
-		c.Handler(client.Connected{})
+	if !c.connected {
+		if c.Handler != nil {
+			c.Handler(client.Connected{})
+		}
 		c.connected = true
 	}
 

@@ -17,6 +17,7 @@ limitations under the License.
 package ctree
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -134,11 +135,11 @@ type expectedQuery struct {
 func TestQuery(t *testing.T) {
 	tr := &Tree{}
 	results := make(map[string]interface{})
-	appendResults := func(p []string, _ *Leaf, v interface{}) { results[strings.Join(p, "/")] = v }
+	appendResults := func(p []string, _ *Leaf, v interface{}) error { results[strings.Join(p, "/")] = v; return nil }
 
 	tr.Query([]string{"*"}, appendResults)
 	if len(results) > 0 {
-		t.Errorf("tr.Query: got %d results, expected 0", len(results))
+		t.Errorf("tr.Query: got %d results (%v), expected 0", len(results), results)
 	}
 
 	buildTree(tr)
@@ -147,6 +148,7 @@ func TestQuery(t *testing.T) {
 		{[]string{"a", "d"}, map[string]interface{}{"a/d": "a/d"}},
 		{[]string{"a"}, map[string]interface{}{"a/d": "a/d", "a/b/c": "a/b/c"}},
 		// A trailing glob is equivalent to a query without it, as above.
+		{[]string{"a", "d", "*"}, map[string]interface{}{"a/d": "a/d"}},
 		{[]string{"a", "*"}, map[string]interface{}{"a/d": "a/d", "a/b/c": "a/b/c"}},
 		{[]string{"*"}, map[string]interface{}{"a/d": "a/d", "a/b/c": "a/b/c", "b/c/d": "b/c/d", "b/a/d": "b/a/d", "c/d/e/f/g/h/i": "c/d/e/f/g/h/i", "d": "d"}},
 		{[]string{"*", "*", "d"}, map[string]interface{}{"b/c/d": "b/c/d", "b/a/d": "b/a/d"}},
@@ -179,12 +181,13 @@ func TestWalk(t *testing.T) {
 	tr := &Tree{}
 	buildTree(tr)
 	paths := [][]string{}
-	tr.Walk(func(path []string, _ *Leaf, value interface{}) {
+	tr.Walk(func(path []string, _ *Leaf, value interface{}) error {
 		got, want := value.(string), strings.Join(path, "/")
 		if got != want {
 			t.Errorf("Walk got value %q, want %q", got, want)
 		}
 		paths = append(paths, path)
+		return nil
 	})
 	if got, want := len(paths), len(testPaths); got != want {
 		t.Errorf("Walk got %d paths, want %d", got, want)
@@ -213,12 +216,13 @@ func TestWalkSorted(t *testing.T) {
 	tr := &Tree{}
 	buildTree(tr)
 	paths := [][]string{}
-	tr.WalkSorted(func(path []string, _ *Leaf, value interface{}) {
+	tr.WalkSorted(func(path []string, _ *Leaf, value interface{}) error {
 		got, want := value.(string), strings.Join(path, "/")
 		if got != want {
 			t.Errorf("WalkSorted got value %q, want %q", got, want)
 		}
 		paths = append(paths, path)
+		return nil
 	})
 	if got, want := len(paths), len(testPaths); got != want {
 		t.Errorf("WalkSorted got %d paths, want %d", got, want)
@@ -230,17 +234,127 @@ func TestWalkSorted(t *testing.T) {
 
 func TestEmptyWalk(t *testing.T) {
 	tr := &Tree{}
-	tr.Walk(func(_ []string, _ *Leaf, _ interface{}) {
+	tr.Walk(func(_ []string, _ *Leaf, _ interface{}) error {
 		t.Error("Walk on empty tree should not call func.")
+		return nil
 	})
-	tr.WalkSorted(func(_ []string, _ *Leaf, _ interface{}) {
+	tr.WalkSorted(func(_ []string, _ *Leaf, _ interface{}) error {
 		t.Error("WalkSorted on empty tree should not call func.")
+		return nil
 	})
+}
+
+func TestVisitFuncError(t *testing.T) {
+	tr := &Tree{}
+	buildTree(tr)
+	err := errors.New("error")
+	var count int
+	visitFunc := func(_ []string, _ *Leaf, _ interface{}) error {
+		count++
+		switch count {
+		case 1:
+			return err
+		default:
+			return fmt.Errorf("got count %d, want 1", count)
+		}
+	}
+
+	if got := tr.Query([]string{"*"}, visitFunc); got != err {
+		t.Errorf("got error %q, want error %q", got, err)
+	}
+
+	count = 0
+	if got := tr.Walk(visitFunc); got != err {
+		t.Errorf("got error %q, want error %q", got, err)
+	}
+
+	count = 0
+	if got := tr.WalkSorted(visitFunc); got != err {
+		t.Errorf("got error %q, want error %q", got, err)
+	}
 }
 
 type expectedDelete struct {
 	subpath []string
 	leaves  map[string]bool
+}
+
+func expectedDeletes() []expectedDelete {
+	return []expectedDelete{
+		{[]string{"x"}, map[string]bool{}},
+		// root delete with glob appended for a non-existing root
+		{[]string{"x", "*"}, map[string]bool{}},
+		{[]string{"d"}, map[string]bool{"d": true}},
+		{[]string{"a"}, map[string]bool{"a/d": true, "a/b/c": true}},
+		// root delete with a glob appended
+		{[]string{"a", "*"}, map[string]bool{"a/d": true, "a/b/c": true}},
+		{[]string{"b", "c", "d"}, map[string]bool{"b/c/d": true}},
+		// delete with glob in the middle of the path
+		{[]string{"b", "*", "d"}, map[string]bool{"b/a/d": true, "b/c/d": true}},
+		// delete with glob in the middle of the path for a non-existing path
+		{[]string{"b", "*", "x"}, map[string]bool{}},
+		{[]string{"b"}, map[string]bool{"b/a/d": true, "b/c/d": true}},
+		{[]string{"c", "d", "e"}, map[string]bool{"c/d/e/f/g/h/i": true}},
+		{[]string{}, map[string]bool{"a/d": true, "a/b/c": true, "b/a/d": true, "b/c/d": true, "c/d/e/f/g/h/i": true, "d": true}},
+		// just glob in the path to delete all the tree
+		{[]string{"*"}, map[string]bool{"a/d": true, "a/b/c": true, "b/a/d": true, "b/c/d": true, "c/d/e/f/g/h/i": true, "d": true}},
+	}
+}
+
+func TestWalkDeleted(t *testing.T) {
+	tr := &Tree{}
+	always := func(interface{}) bool { return true }
+	var ds []string
+	tr.WalkDeleted([]string{"a", "b"}, always, func(v interface{}) { ds = append(ds, v.(string)) })
+	if len(ds) > 0 {
+		t.Errorf("Delete on empty tree should return empty slice.")
+	}
+	for x, tt := range expectedDeletes() {
+		// Rebuild tree for each query.
+		buildTree(tr)
+		var deletes []string
+		tr.WalkDeleted(tt.subpath, always, func(v interface{}) { deletes = append(deletes, v.(string)) })
+		for _, leafPath := range deletes {
+			if _, ok := tt.leaves[leafPath]; !ok {
+				t.Errorf("#%d: unexpected deleted leaf %v", x, leafPath)
+			}
+			delete(tt.leaves, leafPath)
+		}
+		if len(tt.leaves) > 0 {
+			t.Errorf("#%d: expected leaves missing from return: %v", x, tt.leaves)
+		}
+	}
+	if tr.leafBranch != nil {
+		t.Errorf("tree should be empty, but root still has branches %#v", tr.leafBranch)
+	}
+}
+
+func TestWalkDeletedWithCondition(t *testing.T) {
+	never := func(interface{}) bool { return false }
+	tr := &Tree{}
+	buildTree(tr)
+	var leaves []string
+	tr.WalkDeleted([]string{}, never, func(v interface{}) { leaves = append(leaves, v.(string)) })
+	if len(leaves) > 0 {
+		t.Errorf("Leaves deleted for false condition: %v", leaves)
+	}
+	always := func(interface{}) bool { return true }
+	// This is the same test as the last case for TestWalkDeleted.
+	leaves = nil
+	tr.WalkDeleted([]string{}, always, func(v interface{}) { leaves = append(leaves, v.(string)) })
+	if len(leaves) != 6 {
+		t.Errorf("Not all leaves deleted: %v", leaves)
+	}
+	valEqualsD := func(v interface{}) bool { return v == "d" }
+	buildTree(tr)
+	leaves = nil
+	tr.WalkDeleted([]string{}, valEqualsD, func(v interface{}) { leaves = append(leaves, v.(string)) })
+	if expected := []string{"d"}; !reflect.DeepEqual(expected, leaves) {
+		t.Errorf("got %v, expected %v", leaves, expected)
+	}
+	if v := tr.GetLeafValue([]string{"d"}); nil != v {
+		t.Errorf("got %v, expected %v", v, nil)
+	}
 }
 
 func TestDelete(t *testing.T) {
@@ -249,15 +363,7 @@ func TestDelete(t *testing.T) {
 	if len(deleted) > 0 {
 		t.Errorf("Delete on empty tree should return empty slice.")
 	}
-	for x, tt := range []expectedDelete{
-		{[]string{"x"}, map[string]bool{}},
-		{[]string{"d"}, map[string]bool{"d": true}},
-		{[]string{"a"}, map[string]bool{"a/d": true, "a/b/c": true}},
-		{[]string{"b", "c", "d"}, map[string]bool{"b/c/d": true}},
-		{[]string{"b"}, map[string]bool{"b/a/d": true, "b/c/d": true}},
-		{[]string{"c", "d", "e"}, map[string]bool{"c/d/e/f/g/h/i": true}},
-		{[]string{}, map[string]bool{"a/d": true, "a/b/c": true, "b/a/d": true, "b/c/d": true, "c/d/e/f/g/h/i": true, "d": true}},
-	} {
+	for x, tt := range expectedDeletes() {
 		// Rebuild tree for each query.
 		buildTree(tr)
 		for _, leaf := range tr.Delete(tt.subpath) {
@@ -346,7 +452,7 @@ func generatePaths(count int) [][]string {
 	for c := 0; c < count; c++ {
 		p := []string{}
 		for d := 3; d < 16; d++ {
-			p = append(p, string(c%d+65))
+			p = append(p, string(rune(c%d+65)))
 		}
 		paths = append(paths, p)
 	}
@@ -424,8 +530,9 @@ func TestParallelDelete(t *testing.T) {
 }
 
 func query(tr *Tree, path []string) (ret []interface{}) {
-	tr.Query(path, func(_ []string, _ *Leaf, val interface{}) {
+	tr.Query(path, func(_ []string, _ *Leaf, val interface{}) error {
 		ret = append(ret, val)
+		return nil
 	})
 	return ret
 }
@@ -558,7 +665,7 @@ func BenchmarkTreeParallelQuerySingle(b *testing.B) {
 	var x int64
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			t.Query(makePath(atomic.AddInt64(&x, 1)), func(_ []string, _ *Leaf, val interface{}) { c <- val })
+			t.Query(makePath(atomic.AddInt64(&x, 1)), func(_ []string, _ *Leaf, val interface{}) error { c <- val; return nil })
 		}
 	})
 	close(c)
@@ -594,7 +701,7 @@ func BenchmarkTreeParallelQueryMany(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			// For each query, use only a subpath to retrieve multiple elements.
-			t.Query(makePath(atomic.AddInt64(&x, 1))[0:3], func(_ []string, _ *Leaf, val interface{}) { c <- val })
+			t.Query(makePath(atomic.AddInt64(&x, 1))[0:3], func(_ []string, _ *Leaf, val interface{}) error { c <- val; return nil })
 		}
 	})
 	close(c)

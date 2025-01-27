@@ -16,16 +16,23 @@
 
 set -euo pipefail
 
-proto_imports=".:${GOPATH}/src/github.com/google/protobuf/src:${GOPATH}/src"
-
 # Go
-protoc -I=$proto_imports --go_out=. testing/fake/proto/fake.proto
-protoc -I=$proto_imports --go_out=plugins=grpc:. proto/gnmi/gnmi.proto
-protoc -I=$proto_imports --go_out=plugins=grpc:. proto/gnmi_ext/gnmi_ext.proto
-protoc -I=$proto_imports --go_out=. proto/target/target.proto
+if ! which protoc-gen-go-grpc; then
+  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+fi
+protobufsrc=${GOPATH}/src/github.com/google/protobuf/src
+googleapis=${GOPATH}/src/github.com/googleapis/googleapis
+proto_imports_go=".:${protobufsrc}:${googleapis}:${GOPATH}/src"
+protoc -I=$proto_imports_go --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative,require_unimplemented_servers=false testing/fake/proto/fake.proto
+protoc -I=$proto_imports_go --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative,require_unimplemented_servers=false proto/gnmi/gnmi.proto
+protoc -I=$proto_imports_go --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative,require_unimplemented_servers=false proto/collector/collector.proto
+protoc -I=$proto_imports_go --go_out=. --go_opt=paths=source_relative proto/gnmi_ext/gnmi_ext.proto
+protoc -I=$proto_imports_go --go_out=. --go_opt=paths=source_relative proto/target/target.proto
 
 # Python
-python -m grpc_tools.protoc -I=$proto_imports --python_out=. --grpc_python_out=. testing/fake/proto/fake.proto
-python -m grpc_tools.protoc -I=$proto_imports --python_out=. --grpc_python_out=. proto/gnmi_ext/gnmi_ext.proto
-python -m grpc_tools.protoc -I=$proto_imports --python_out=. --grpc_python_out=. proto/gnmi_ext/gnmi_ext.proto
-python -m grpc_tools.protoc -I=$proto_imports --python_out=. --grpc_python_out=. proto/target/target.proto
+proto_imports_python=".:${GOPATH}/src"
+python3 -m grpc_tools.protoc -I=$proto_imports_python --python_out=. --grpc_python_out=. testing/fake/proto/fake.proto
+python3 -m grpc_tools.protoc -I=$proto_imports_python --python_out=. --grpc_python_out=. proto/gnmi/gnmi.proto
+python3 -m grpc_tools.protoc -I=$proto_imports_python --python_out=. --grpc_python_out=. proto/gnmi_ext/gnmi_ext.proto
+python3 -m grpc_tools.protoc -I=$proto_imports_python --python_out=. --grpc_python_out=. proto/target/target.proto
+python3 -m grpc_tools.protoc -I=$proto_imports_python --python_out=. --grpc_python_out=. proto/collector/collector.proto
