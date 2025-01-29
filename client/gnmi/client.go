@@ -274,7 +274,7 @@ func subscribe(q client.Query) (*gpb.SubscribeRequest, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid query path %q: %v", qq, err)
 		}
-		s.Subscribe.Subscription = append(s.Subscribe.Subscription, &gpb.Subscription{Path: pp})
+		s.Subscribe.Subscription = append(s.Subscribe.Subscription, &gpb.Subscription{Path: pp, Mode: q.Streaming_type, SampleInterval: q.Streaming_sample_int, HeartbeatInterval: q.Heartbeat_int, SuppressRedundant: q.Suppress_redundant})
 	}
 	return &gpb.SubscribeRequest{Request: s}, nil
 }

@@ -109,6 +109,12 @@ var (
 	expected_cnt = flag.Uint("expected_count", 0, "End upon receiving the count of responses.")
 	expected_event = flag.String("expected_event", "", "Event to capture")
 	streaming_timeout = flag.Uint("streaming_timeout", 0, "Exits after this time.")
+
+	//Subscribe Options
+	streaming_type = flag.String("streaming_type", "TARGET_DEFINED", "One of TARGET_DEFINED, ON_CHANGE or SAMPLE")
+	streaming_sample_int = flag.Uint("streaming_sample_interval", 0, "Streaming sample inteval seconds, 0 means lowest supported.")
+	heartbeat_int = flag.Uint("heartbeat_interval", 0, "Heartbeat inteval seconds.")
+	suppress_redundant = flag.Bool("suppress_redundant", false, "Suppress Redundant Subscription Updates")
 )
 
 func init() {
@@ -378,6 +384,22 @@ func executeSubscribe(ctx context.Context) error {
 	if len(*queryFlag) == 0 {
 		return errors.New("--query must be set")
 	}
+	if *streaming_type == "TARGET_DEFINED" {
+		q.Streaming_type = gpb.SubscriptionMode(0)
+	} else if *streaming_type ==  "ON_CHANGE" {
+		q.Streaming_type =  gpb.SubscriptionMode(1)
+	} else if *streaming_type ==  "SAMPLE" {
+		q.Streaming_type = gpb.SubscriptionMode(2)
+	} else {
+		return errors.New("-streaming_type must be one of: (TARGET_DEFINED, ON_CHANGE, SAMPLE)")
+	}
+	q.Streaming_sample_int = uint64(*streaming_sample_int)*uint64(time.Second)
+	if *queryType == "streaming" || *queryType == "s" {
+		q.Heartbeat_int = uint64(*heartbeat_int)*uint64(time.Second)
+	} else if *heartbeat_int > 0  {
+		return errors.New("-heartbeat_interval only valid with streaming query type")
+	}
+	q.Suppress_redundant = bool(*suppress_redundant)
 	for _, path := range *queryFlag {
 		query, err := parseQuery(path, cfg.Delimiter)
 		if err != nil {
