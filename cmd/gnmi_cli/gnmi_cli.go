@@ -28,6 +28,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -56,12 +57,31 @@ import (
 )
 
 var (
+	displayHandle = os.Stdout
+	prefix = []byte("[\n")
+	rcvd_cnt uint = 0
+	term = make(chan string, 1)	
 	q   = client.Query{TLS: &tls.Config{}}
 	mu  sync.Mutex
 	cfg = cli.Config{Display: func(b []byte) {
-		defer mu.Unlock()
-		mu.Lock()
-		os.Stdout.Write(append(b, '\n'))
+		found := len(*expected_event) == 0
+		if !found {
+			var fvp map[string]interface{}
+
+			json.Unmarshal(b, &fvp)
+			_, found = fvp[*expected_event]
+		}
+		if found {
+			defer mu.Unlock()
+			mu.Lock()
+
+			if *expected_cnt > 0 {
+				rcvd_cnt += 1
+			}
+			displayHandle.Write(prefix)
+			displayHandle.Write(b)
+			prefix = []byte(",\n")
+		}
 	}}
 
 	clientTypes = flags.NewStringList(&cfg.ClientTypes, []string{gclient.Type})
@@ -84,6 +104,11 @@ var (
 	caCert       = flag.String("ca_crt", "", "CA certificate file. Used to verify server TLS certificate.")
 	clientCert   = flag.String("client_crt", "", "Client certificate file. Used for client certificate-based authentication.")
 	clientKey    = flag.String("client_key", "", "Client private key file. Used for client certificate-based authentication.")
+
+	output_file = flag.String("output_file", "", "Output file to write the response")
+	expected_cnt = flag.Uint("expected_count", 0, "End upon receiving the count of responses.")
+	expected_event = flag.String("expected_event", "", "Event to capture")
+	streaming_timeout = flag.Uint("streaming_timeout", 0, "Exits after this time.")
 )
 
 func init() {
@@ -137,12 +162,52 @@ func init() {
 func main() {
 	flag.Parse()
 
+	defer func() {
+		displayHandle.Write([]byte("\n]\n"))
+		displayHandle.Close()
+	}()
+
+	if len(*output_file) != 0 {
+		var err error
+		displayHandle, err = os.OpenFile(*output_file, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Error(fmt.Printf("unable to create output file(%v) err=%v\n", *output_file, err))
+			return
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
+
 	// Terminate immediately on Ctrl+C, skipping lame-duck mode.
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt)
 		<-c
+		cancel()
+	}()
+
+	go func() {
+		if *streaming_timeout > 0 {
+			var sleep_cnt uint = 0
+			for sleep_cnt < *streaming_timeout {
+				time.Sleep(time.Second)
+				sleep_cnt += 1
+				if *expected_cnt <= rcvd_cnt {
+					s := fmt.Sprintf("Received all. expected:%d rcvd:%d", *expected_cnt, rcvd_cnt)
+					log.V(7).Infof("Writing to terminate: %v", s)
+					term <- s
+					return
+				}
+			}
+			s := fmt.Sprintf("Timeout %d Secs", *streaming_timeout)
+			log.V(7).Infof("Writing to terminate: %v", s)
+			term <- s
+		}
+	}()
+
+	go func() {
+		// Terminate when indicated.
+		m := <-term
+		log.V(1).Infof("Terminating due to %v", m)
 		cancel()
 	}()
 
