@@ -118,6 +118,7 @@ type Destination struct {
 	TunnelConn *tunnel.Conn
 	// Encoding is the subscription response encoding value.
 	Encoding gpb.Encoding
+	
 }
 
 // Validate validates the fields of Destination.
@@ -184,6 +185,10 @@ type Query struct {
 	TunnelConn *tunnel.Conn
 	// Encoding is the subscription response encoding value.
 	Encoding gpb.Encoding
+	Streaming_type gpb.SubscriptionMode
+	Streaming_sample_int uint64
+	Heartbeat_int uint64
+	Suppress_redundant bool	
 }
 
 // Destination extracts a Destination instance out of Query fields.
