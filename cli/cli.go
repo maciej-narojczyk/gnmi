@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -305,7 +306,8 @@ func displayPollingResults(ctx context.Context, query client.Query, cfg *Config)
 // subsequent individual updates as they arrive.
 func displayStreamingResults(ctx context.Context, query client.Query, cfg *Config) error {
 	c := client.New()
-	complete := false
+	onChange := query.Streaming_type == gpb.SubscriptionMode(1)
+	complete := onChange
 	display := func(path []string, ts time.Time, val interface{}) {
 		if !complete {
 			return
@@ -314,8 +316,15 @@ func displayStreamingResults(ctx context.Context, query client.Query, cfg *Confi
 		if t := formatTime(ts, cfg); t != nil {
 			b.add(append(path, "timestamp"), t)
 			b.add(append(path, "value"), val)
-		} else {
+		} else if !onChange {
 			b.add(path, val)
+		} else {
+			v := reflect.ValueOf(val)
+			if v.Kind() == reflect.String {
+				json.Unmarshal([]byte(v.String()), &b)
+			} else {
+				b.add(path, val)
+			}
 		}
 		cfg.Display(b.display(cfg.DisplayPrefix, cfg.DisplayIndent))
 	}
