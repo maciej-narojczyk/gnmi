@@ -89,7 +89,7 @@ func (c *Client) Subscribe(ctx context.Context, q client.Query) error {
 	c.Rd.Rts = append(c.Rd.Rts, time.Now())
 	log.V(3).Infof("Subscribe:  c.Rd %v", c.Rd)
 	if q.ProtoHandler == nil {
-		c.recv = c.defaultRecv
+		// c.recv = c.defaultRecv
 		c.handler = q.NotificationHandler
 	} else {
 		c.recv = q.ProtoHandler

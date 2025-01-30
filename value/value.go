@@ -143,16 +143,6 @@ func ToScalar(tv *pb.TypedValue) (interface{}, error) {
 			Value:   i,
 		}
 		return uVal, nil
-	case *gpb.TypedValue_JsonIetfVal:
-		v := tv.GetJsonIetfVal()
-		if err := json.Unmarshal(v, &i); err != nil {
-			return nil, err
-		}
-		uVal := DeprecatedScalar{
-			Message: "Deprecated TypedValue_JsonIetfVal",
-			Value:   i,
-		}
-		return uVal, nil
 	default:
 		return nil, fmt.Errorf("non-scalar type %+v", tv.Value)
 	}

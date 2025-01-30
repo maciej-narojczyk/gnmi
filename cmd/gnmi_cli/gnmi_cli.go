@@ -39,21 +39,18 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"context"
 	"flag"
 
 	log "github.com/golang/glog"
 	"golang.org/x/crypto/ssh/terminal"
 	"google.golang.org/protobuf/encoding/prototext"
-	"github.com/golang/protobuf/proto"
-	"github.com/jipanyang/gnmi/cli"
+	"github.com/openconfig/gnmi/cli"
 	"github.com/openconfig/gnmi/client"
 	"github.com/openconfig/gnmi/client/flags"
-	"golang.org/x/crypto/ssh/terminal"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 	// Register supported client types.
-	gclient "github.com/jipanyang/gnmi/client/gnmi"
+	gclient "github.com/openconfig/gnmi/client/gnmi"
 )
 
 var (

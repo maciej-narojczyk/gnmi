@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	log "github.com/golang/glog"
-	stats "github.com/jipanyang/gnmi/cli/stats"
+	stats "github.com/openconfig/gnmi/cli/stats"
 	"github.com/openconfig/gnmi/client"
 	//	"strconv"
 	"encoding/json"
@@ -323,17 +323,13 @@ func addSessionPollPoints(rd *stats.Record) plotter.XYs {
 }
 
 func plotSessionGraph(title, x, y string, rd *stats.Record) error {
-	p, err := plot.New()
-	if err != nil {
-		log.V(1).Infof("plot %v", err)
-		return err
-	}
+	p := plot.New()
 
 	p.Title.Text = title
 	p.X.Label.Text = x
 	p.Y.Label.Text = y
 
-	err = plotutil.AddLinePoints(p,
+	err := plotutil.AddLinePoints(p,
 		"Poll Session", addSessionPollPoints(rd))
 	if err != nil {
 		log.V(1).Infof("plotutil.AddLinePoints %v", err)
@@ -363,17 +359,13 @@ func addCpuUtilPoints(cpuRecs []cpuStat) plotter.XYs {
 }
 
 func plotCpuGraph(title, x, y string, cpuLoadRecs, cpuRecs []cpuStat) error {
-	p, err := plot.New()
-	if err != nil {
-		log.V(1).Infof("plot %v", err)
-		return err
-	}
+	p := plot.New()
 
 	p.Title.Text = title
 	p.X.Label.Text = x
 	p.Y.Label.Text = y
 
-	err = plotutil.AddLinePoints(p,
+	err := plotutil.AddLinePoints(p,
 		"cpuWithTelemetry", addCpuUtilPoints(cpuLoadRecs),
 		"cpuWithoutTelemetry", addCpuUtilPoints(cpuRecs))
 	if err != nil {
@@ -418,17 +410,13 @@ func addGroupPoints(grps []uint, grpMap map[uint]groupRecord) plotter.XYs {
 }
 
 func plotGroupsGraph(title, x, y string, grps []uint, grpMap map[uint]groupRecord) error {
-	p, err := plot.New()
-	if err != nil {
-		log.V(1).Infof("plot %v", err)
-		return err
-	}
+	p := plot.New()
 
 	p.Title.Text = title
 	p.X.Label.Text = x
 	p.Y.Label.Text = y
 
-	err = plotutil.AddLinePoints(p,
+	err := plotutil.AddLinePoints(p,
 		"Groups", addGroupPoints(grps, grpMap))
 	if err != nil {
 		log.V(1).Infof("plotutil.AddLinePoints %v", err)
